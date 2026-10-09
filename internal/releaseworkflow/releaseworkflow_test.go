@@ -328,7 +328,7 @@ if args[0] == "api":
             print("gh: Not Found (HTTP 404)", file=sys.stderr); sys.exit(1)
         print(json.dumps(load()))
     elif target.endswith("/releases?per_page=100"):
-        print(json.dumps([[load()]] if state_path.exists() else [[]]))
+        if state_path.exists(): print(json.dumps(load()))
     elif target.endswith("/releases/1"):
         if not state_path.exists():
             print("gh: Not Found (HTTP 404)", file=sys.stderr); sys.exit(1)

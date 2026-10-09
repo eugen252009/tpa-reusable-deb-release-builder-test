@@ -3,6 +3,7 @@ package releaseworkflow
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -220,19 +221,21 @@ func getRelease(repository, tag string) (githubRelease, bool, error) {
 		}
 		// GitHub's release-by-tag endpoint omits drafts. Drafts remain visible
 		// through the release collection to callers with contents:write access.
-		output, err = ghOutput("api", "--paginate", "--slurp", "repos/"+repository+"/releases?per_page=100")
+		output, err = ghOutput("api", "--paginate", "--jq", ".[]", "repos/"+repository+"/releases?per_page=100")
 		if err != nil {
 			return githubRelease{}, false, err
 		}
-		var pages [][]githubRelease
-		if err := json.Unmarshal([]byte(output), &pages); err != nil {
-			return githubRelease{}, false, fmt.Errorf("decode GitHub release list: %w", err)
-		}
-		for _, page := range pages {
-			for _, release := range page {
-				if release.TagName == tag {
-					return validateGitHubRelease(release)
+		decoder := json.NewDecoder(strings.NewReader(output))
+		for {
+			var release githubRelease
+			if err := decoder.Decode(&release); err != nil {
+				if err == io.EOF {
+					break
 				}
+				return githubRelease{}, false, fmt.Errorf("decode GitHub release list: %w", err)
+			}
+			if release.TagName == tag {
+				return validateGitHubRelease(release)
 			}
 		}
 		return githubRelease{}, false, nil

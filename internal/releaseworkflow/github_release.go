@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"time"
 )
 
 var githubRepositoryRE = regexp.MustCompile(`^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$`)
@@ -77,23 +78,18 @@ func PublishGitHubRelease(options PublishOptions) error {
 		return err
 	}
 	if !exists {
-		if err := createDraftRelease(options, sentinel); err != nil {
-			// Concurrent identical workflow runs may create the draft first.
-			release, exists, err = getRelease(options.Repository, options.Plan.Tag)
-			if err != nil {
-				return err
+		createErr := createDraftRelease(options, sentinel)
+		// GitHub's release collection can lag behind successful draft creation.
+		// Concurrent identical workflow runs may also create the draft first.
+		release, exists, err = waitForGitHubRelease(options.Repository, options.Plan.Tag)
+		if err != nil {
+			return fmt.Errorf("read draft release after creation: %w", err)
+		}
+		if !exists {
+			if createErr != nil {
+				return fmt.Errorf("draft release could not be found after creation race: %w", createErr)
 			}
-			if !exists {
-				return fmt.Errorf("draft release could not be found after creation race")
-			}
-		} else {
-			release, exists, err = getRelease(options.Repository, options.Plan.Tag)
-			if err != nil {
-				return fmt.Errorf("draft release was not readable after creation: %w", err)
-			}
-			if !exists {
-				return fmt.Errorf("draft release was not readable after creation")
-			}
+			return fmt.Errorf("draft release was not readable after creation")
 		}
 	}
 	if release.TagName != options.Plan.Tag {
@@ -245,6 +241,20 @@ func getRelease(repository, tag string) (githubRelease, bool, error) {
 		return githubRelease{}, false, err
 	}
 	return validateGitHubRelease(release)
+}
+
+func waitForGitHubRelease(repository, tag string) (githubRelease, bool, error) {
+	const attempts = 12
+	for attempt := 0; attempt < attempts; attempt++ {
+		release, exists, err := getRelease(repository, tag)
+		if err != nil || exists {
+			return release, exists, err
+		}
+		if attempt+1 < attempts {
+			time.Sleep(500 * time.Millisecond)
+		}
+	}
+	return githubRelease{}, false, nil
 }
 
 func validateGitHubRelease(release githubRelease) (githubRelease, bool, error) {

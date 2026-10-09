@@ -164,14 +164,14 @@ func TestBuildPackageAndReproducibleBundle(t *testing.T) {
 	root := repositoryRoot(t)
 	workspace := makeGitWorkspace(t)
 	commit := gitTest(t, workspace, "rev-parse", "HEAD")
-	gitTest(t, workspace, "tag", "v1.2.3", commit)
+	gitTest(t, workspace, "tag", "v1.2.3-rc.1", commit)
 	epochText := gitTest(t, workspace, "show", "-s", "--format=%ct", commit)
 	epoch := int64(0)
 	if _, err := fmt.Sscan(epochText, &epoch); err != nil {
 		t.Fatal(err)
 	}
-	plan := Plan{SchemaVersion: 1, Project: "example", Package: "example", Version: "1.2.3", Tag: "v1.2.3",
-		Ref: "refs/tags/v1.2.3", SourceCommit: commit, SourceDateEpoch: epoch, Release: true, Reproducibility: true,
+	plan := Plan{SchemaVersion: 1, Project: "example", Package: "example", Version: "1.2.3~rc.1", Tag: "v1.2.3-rc.1",
+		Ref: "refs/tags/v1.2.3-rc.1", SourceCommit: commit, SourceDateEpoch: epoch, Release: true, Reproducibility: true,
 		Architectures: []string{"amd64"}, ArchitectureSpecs: map[string]ArchitectureConfig{"amd64": {Runner: "ubuntu-24.04", Runtime: "native"}}}
 	cfg := testConfig()
 	cfg.Project.Name = "example"
@@ -232,7 +232,7 @@ func TestBuildPackageAndReproducibleBundle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(manifest.Artifacts) != 1 || manifest.Build.ProjectTests != "passed" || len(manifest.Build.RebuildHashes) != 2 || manifest.Artifacts[0].ControlFields["MemaSchema"] != "schema-1.2.3" {
+	if len(manifest.Artifacts) != 1 || manifest.Build.ProjectTests != "passed" || len(manifest.Build.RebuildHashes) != 2 || manifest.Artifacts[0].ControlFields["MemaSchema"] != "schema-1.2.3~rc.1" {
 		t.Fatalf("unexpected release manifest: %+v", manifest)
 	}
 	if err := VerifyBundle(cfg, plan, bundleDir, "dev", tpaCommit); err != nil {
@@ -288,7 +288,8 @@ func TestBuildPackageAndReproducibleBundle(t *testing.T) {
 	if state.Draft || state.Uploads != 1 || len(state.Assets) != 5 {
 		t.Fatalf("unexpected fake release state: %+v", state)
 	}
-	remotePackage := filepath.Join(filepath.Dir(statePath), "assets", manifest.Artifacts[0].Filename)
+	remotePackageName := strings.ReplaceAll(manifest.Artifacts[0].Filename, "~", ".")
+	remotePackage := filepath.Join(filepath.Dir(statePath), "assets", remotePackageName)
 	if err := os.WriteFile(remotePackage, []byte("tampered"), 0644); err != nil {
 		t.Fatal(err)
 	}
@@ -351,8 +352,9 @@ elif args[:2] == ["release", "upload"]:
         sources.append(args[index]); index += 1
     for source in sources:
         source_path = pathlib.Path(source)
-        shutil.copyfile(source_path, asset_dir / source_path.name)
-        value["assets"].append({"name": source_path.name, "size": source_path.stat().st_size})
+        remote_name = source_path.name.replace("~", ".")
+        shutil.copyfile(source_path, asset_dir / remote_name)
+        value["assets"].append({"name": remote_name, "size": source_path.stat().st_size})
     value["uploads"] += 1
     save(value)
 elif args[:2] == ["release", "download"]:

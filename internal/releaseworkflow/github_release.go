@@ -106,19 +106,21 @@ func PublishGitHubRelease(options PublishOptions) error {
 		}
 		remoteNames[asset.Name] = asset.Size
 	}
-	localNames := make(map[string]string, len(assets))
+	localNames := make(map[string]string, len(assets)*2)
 	for _, asset := range assets {
-		localNames[filepath.Base(asset)] = asset
-		if _, exists := remoteNames[filepath.Base(asset)]; !exists {
-			continue
-		}
-		if remoteNames[filepath.Base(asset)] <= 0 {
-			return fmt.Errorf("GitHub release asset %s has invalid size", filepath.Base(asset))
+		for _, name := range githubReleaseAssetNames(filepath.Base(asset)) {
+			if previous, duplicate := localNames[name]; duplicate && previous != asset {
+				return fmt.Errorf("release assets %q and %q collide as GitHub asset name %q", previous, asset, name)
+			}
+			localNames[name] = asset
 		}
 	}
-	for name := range remoteNames {
+	for name, size := range remoteNames {
 		if _, expected := localNames[name]; !expected {
 			return fmt.Errorf("GitHub release contains unexpected asset %q; refusing to overwrite or delete it", name)
+		}
+		if size <= 0 {
+			return fmt.Errorf("GitHub release asset %s has invalid size", name)
 		}
 	}
 
@@ -141,10 +143,10 @@ func PublishGitHubRelease(options PublishOptions) error {
 	}
 
 	if !release.Draft {
-		if len(remoteNames) != len(localNames) {
+		if len(remoteNames) != len(assets) {
 			return fmt.Errorf("published GitHub release is incomplete; refusing mutation")
 		}
-		if err := verifyReleaseAssetSet(options.Repository, release.ID, localNames); err != nil {
+		if err := verifyReleaseAssetSet(options.Repository, release.ID, localNames, len(assets)); err != nil {
 			return err
 		}
 		fmt.Printf("GitHub Release %s already contains the identical qualified artifacts; no assets changed.\n", options.Plan.Tag)
@@ -152,8 +154,15 @@ func PublishGitHubRelease(options PublishOptions) error {
 	}
 
 	missing := make([]string, 0)
-	for name, path := range localNames {
-		if _, ok := remoteNames[name]; !ok {
+	for _, path := range assets {
+		present := false
+		for _, name := range githubReleaseAssetNames(filepath.Base(path)) {
+			if _, ok := remoteNames[name]; ok {
+				present = true
+				break
+			}
+		}
+		if !present {
 			missing = append(missing, path)
 		}
 	}
@@ -166,7 +175,7 @@ func PublishGitHubRelease(options PublishOptions) error {
 			return fmt.Errorf("upload draft release assets: %w", err)
 		}
 	}
-	if err := verifyReleaseAssetSet(options.Repository, release.ID, localNames); err != nil {
+	if err := verifyReleaseAssetSet(options.Repository, release.ID, localNames, len(assets)); err != nil {
 		return err
 	}
 	if err := verifyRemoteTag(options.Repository, options.Plan.Tag, options.Plan.SourceCommit); err != nil {
@@ -182,13 +191,13 @@ func PublishGitHubRelease(options PublishOptions) error {
 	if final.Draft {
 		return fmt.Errorf("GitHub Release remains a draft after publication request")
 	}
-	if err := verifyReleaseAssetSet(options.Repository, final.ID, localNames); err != nil {
+	if err := verifyReleaseAssetSet(options.Repository, final.ID, localNames, len(assets)); err != nil {
 		return err
 	}
 	if err := verifyRemoteTag(options.Repository, options.Plan.Tag, options.Plan.SourceCommit); err != nil {
 		return err
 	}
-	fmt.Printf("GitHub Release %s published with %d verified assets.\n", options.Plan.Tag, len(localNames))
+	fmt.Printf("GitHub Release %s published with %d verified assets.\n", options.Plan.Tag, len(assets))
 	return nil
 }
 
@@ -330,7 +339,18 @@ func releaseAssets(bundle string) ([]string, error) {
 	return paths, nil
 }
 
-func verifyReleaseAssetSet(repository string, releaseID int64, expected map[string]string) error {
+func githubReleaseAssetNames(name string) []string {
+	// GitHub normalizes tildes to dots in uploaded release asset names.
+	// Accept both forms when reading existing assets, but upload the exact
+	// qualified local filename and verify the downloaded bytes either way.
+	normalized := strings.ReplaceAll(name, "~", ".")
+	if normalized == name {
+		return []string{name}
+	}
+	return []string{name, normalized}
+}
+
+func verifyReleaseAssetSet(repository string, releaseID int64, expected map[string]string, expectedCount int) error {
 	output, err := ghOutput("api", "repos/"+repository+"/releases/"+fmt.Sprint(releaseID))
 	if err != nil {
 		return err
@@ -339,8 +359,8 @@ func verifyReleaseAssetSet(repository string, releaseID int64, expected map[stri
 	if err := json.Unmarshal([]byte(output), &release); err != nil {
 		return err
 	}
-	if len(release.Assets) != len(expected) {
-		return fmt.Errorf("GitHub release asset set is incomplete: found %d, expected %d", len(release.Assets), len(expected))
+	if len(release.Assets) != expectedCount {
+		return fmt.Errorf("GitHub release asset set is incomplete: found %d, expected %d", len(release.Assets), expectedCount)
 	}
 	tmp, err := os.MkdirTemp("", "tpa-release-readback-")
 	if err != nil {

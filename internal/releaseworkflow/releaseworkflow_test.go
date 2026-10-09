@@ -314,6 +314,9 @@ def save(value):
     state_path.write_text(json.dumps(value))
 def path_arg():
     return next((a for a in args if a.startswith("repos/")), "")
+def check_repo():
+    if "--repo" not in args or args[args.index("--repo") + 1] != "example/project":
+        print("release command omitted explicit repository: " + repr(args), file=sys.stderr); sys.exit(2)
 if args[0] == "api":
     target = path_arg()
     if "/commits/" in target:
@@ -327,17 +330,27 @@ if args[0] == "api":
     else:
         print("unexpected fake gh api request: " + repr(args), file=sys.stderr); sys.exit(2)
 elif args[:2] == ["release", "create"]:
+    check_repo()
     notes = pathlib.Path(args[args.index("--notes-file") + 1]).read_text()
     save({"id": 1, "tag_name": args[2], "draft": True, "name": args[args.index("--title") + 1], "body": notes, "assets": [], "uploads": 0})
 elif args[:2] == ["release", "upload"]:
+    check_repo()
     value = load()
-    for source in args[3:]:
+    sources = []
+    index = 3
+    while index < len(args):
+        if args[index] == "--repo":
+            index += 2
+            continue
+        sources.append(args[index]); index += 1
+    for source in sources:
         source_path = pathlib.Path(source)
         shutil.copyfile(source_path, asset_dir / source_path.name)
         value["assets"].append({"name": source_path.name, "size": source_path.stat().st_size})
     value["uploads"] += 1
     save(value)
 elif args[:2] == ["release", "download"]:
+    check_repo()
     value = load(); dest = pathlib.Path(args[args.index("--dir") + 1]); dest.mkdir(parents=True, exist_ok=True)
     for asset in value["assets"]: shutil.copyfile(asset_dir / asset["name"], dest / asset["name"])
 else:

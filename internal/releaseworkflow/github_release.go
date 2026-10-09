@@ -131,7 +131,7 @@ func PublishGitHubRelease(options PublishOptions) error {
 			return err
 		}
 		defer os.RemoveAll(downloadDir)
-		if err := ghRun("release", "download", options.Plan.Tag, "--dir", downloadDir); err != nil {
+		if err := ghRun("release", "download", options.Plan.Tag, "--dir", downloadDir, "--repo", options.Repository); err != nil {
 			return fmt.Errorf("read back existing GitHub release assets: %w", err)
 		}
 		for name, remoteSize := range remoteNames {
@@ -164,6 +164,7 @@ func PublishGitHubRelease(options PublishOptions) error {
 	if len(missing) > 0 {
 		args := []string{"release", "upload", options.Plan.Tag}
 		args = append(args, missing...)
+		args = append(args, "--repo", options.Repository)
 		if err := ghRun(args...); err != nil {
 			return fmt.Errorf("upload draft release assets: %w", err)
 		}
@@ -231,7 +232,7 @@ func getRelease(repository, tag string) (githubRelease, bool, error) {
 
 func createDraftRelease(options PublishOptions, sentinel string) error {
 	title := options.Config.Project.Name + " " + options.Plan.Version
-	args := []string{"release", "create", options.Plan.Tag, "--draft", "--verify-tag", "--target", options.Plan.SourceCommit, "--title", title}
+	args := []string{"release", "create", options.Plan.Tag, "--draft", "--verify-tag", "--target", options.Plan.SourceCommit, "--title", title, "--repo", options.Repository}
 	notes, err := readRegularFile(filepath.Join(options.BundleDir, "release-notes.md"))
 	if err != nil {
 		return fmt.Errorf("release notes are required to identify workflow-owned drafts: %w", err)
@@ -312,7 +313,7 @@ func verifyReleaseAssetSet(repository string, releaseID int64, expected map[stri
 		return err
 	}
 	defer os.RemoveAll(tmp)
-	if err := ghRun("release", "download", release.TagName, "--dir", tmp); err != nil {
+	if err := ghRun("release", "download", release.TagName, "--dir", tmp, "--repo", repository); err != nil {
 		return fmt.Errorf("download release assets for independent read-back: %w", err)
 	}
 	seen := make(map[string]bool, len(release.Assets))

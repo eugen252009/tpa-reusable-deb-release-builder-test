@@ -215,15 +215,36 @@ func verifyRemoteTag(repository, tag, expectedCommit string) error {
 func getRelease(repository, tag string) (githubRelease, bool, error) {
 	output, err := ghOutput("api", "repos/"+repository+"/releases/tags/"+tag)
 	if err != nil {
-		if strings.Contains(strings.ToLower(err.Error()), "404") || strings.Contains(strings.ToLower(err.Error()), "not found") {
-			return githubRelease{}, false, nil
+		if !strings.Contains(strings.ToLower(err.Error()), "404") && !strings.Contains(strings.ToLower(err.Error()), "not found") {
+			return githubRelease{}, false, err
 		}
-		return githubRelease{}, false, err
+		// GitHub's release-by-tag endpoint omits drafts. Drafts remain visible
+		// through the release collection to callers with contents:write access.
+		output, err = ghOutput("api", "--paginate", "--slurp", "repos/"+repository+"/releases?per_page=100")
+		if err != nil {
+			return githubRelease{}, false, err
+		}
+		var pages [][]githubRelease
+		if err := json.Unmarshal([]byte(output), &pages); err != nil {
+			return githubRelease{}, false, fmt.Errorf("decode GitHub release list: %w", err)
+		}
+		for _, page := range pages {
+			for _, release := range page {
+				if release.TagName == tag {
+					return validateGitHubRelease(release)
+				}
+			}
+		}
+		return githubRelease{}, false, nil
 	}
 	var release githubRelease
 	if err := json.Unmarshal([]byte(output), &release); err != nil {
 		return githubRelease{}, false, err
 	}
+	return validateGitHubRelease(release)
+}
+
+func validateGitHubRelease(release githubRelease) (githubRelease, bool, error) {
 	if release.ID == 0 || release.TagName == "" {
 		return githubRelease{}, false, fmt.Errorf("GitHub returned an invalid release record")
 	}

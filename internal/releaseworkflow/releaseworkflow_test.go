@@ -323,7 +323,13 @@ if args[0] == "api":
         print(json.dumps({"sha": os.environ["FAKE_GH_COMMIT"]}))
     elif "--method" in args and "PATCH" in args:
         value = load(); value["draft"] = False; save(value); print(json.dumps(value))
-    elif "/releases/tags/" in target or target.endswith("/releases/1"):
+    elif "/releases/tags/" in target:
+        if not state_path.exists() or load()["draft"]:
+            print("gh: Not Found (HTTP 404)", file=sys.stderr); sys.exit(1)
+        print(json.dumps(load()))
+    elif target.endswith("/releases?per_page=100"):
+        print(json.dumps([[load()]] if state_path.exists() else [[]]))
+    elif target.endswith("/releases/1"):
         if not state_path.exists():
             print("gh: Not Found (HTTP 404)", file=sys.stderr); sys.exit(1)
         print(json.dumps(load()))

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -74,6 +75,160 @@ func TestNoProvenanceFlagDisablesAutomaticMetadata(t *testing.T) {
 	}
 	if text := string(persistentControl); strings.Contains(text, "TPA-Version:") || strings.Contains(text, "Created-At:") {
 		t.Fatalf("persistent provenance=false did not disable automatic metadata:\n%s", text)
+	}
+}
+
+func TestCapabilitiesCommandReturnsVersionedMachineContract(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"capabilities"}, bytes.NewReader(nil), &stdout, &stderr); code != 0 {
+		t.Fatalf("capabilities exit=%d stderr=%q", code, stderr.String())
+	}
+	var got aptpackage.Capabilities
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+		t.Fatalf("decode capabilities: %v; output=%q", err, stdout.String())
+	}
+	want := aptpackage.GetCapabilities()
+	if got.Format != want.Format || got.Version != want.Version || got.TPAVersion != version.Version ||
+		got.RepositoryFormat != want.RepositoryFormat || strings.Join(got.Operations, "\x00") != strings.Join(want.Operations, "\x00") {
+		t.Fatalf("capabilities contract mismatch: got=%+v want=%+v", got, want)
+	}
+	hasPackEmpty := false
+	for _, operation := range got.Operations {
+		if operation == "repository.pack-empty.v1" {
+			hasPackEmpty = true
+		}
+		if strings.HasPrefix(operation, "repository.initialize-") {
+			t.Fatal("capabilities still advertise a separate empty-initialization operation")
+		}
+	}
+	if !hasPackEmpty {
+		t.Fatalf("capabilities omit canonical pack --empty operation: %v", got.Operations)
+	}
+	if len(got.OutputBackends) != 2 || got.OutputBackends[1].Name != "ssh-sftp" ||
+		!got.OutputBackends[1].RequiresOpenSSHClient || !got.OutputBackends[1].StrictHostKeyChecking ||
+		!got.OutputBackends[1].NewDestinationOnly || got.OutputBackends[1].ExistingDestinationReplacement ||
+		!got.OutputBackends[1].TPAWriterLock {
+		t.Fatalf("SSH output contract missing or unsafe: %+v", got.OutputBackends)
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if code := run([]string{"capabilities", "--json"}, bytes.NewReader(nil), &stdout, &stderr); code == 0 {
+		t.Fatal("capabilities accepted an undeclared argument")
+	}
+}
+
+func TestPackEmptyIsCanonicalAndRefusesExistingOutput(t *testing.T) {
+	root := t.TempDir()
+	repository := filepath.Join(root, "empty-repo")
+	var stdout, stderr bytes.Buffer
+	args := []string{"pack", "--empty", "--output", repository}
+	if code := run(args, bytes.NewReader(nil), &stdout, &stderr); code != 0 {
+		t.Fatalf("pack --empty exit=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	cfg := aptpackage.Config{OutDir: repository, Repo: aptpackage.RepoConfig{Suite: "stable", Codename: "stable", Components: "main"}}
+	if err := aptpackage.VerifyTPARepositoryTree(cfg); err != nil {
+		t.Fatalf("verify pack --empty result: %v", err)
+	}
+	if !strings.Contains(stdout.String(), "Empty repository initialized") {
+		t.Fatalf("missing empty repository result: %q", stdout.String())
+	}
+
+	protected := filepath.Join(root, "protected")
+	if err := os.Mkdir(protected, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(protected, "keep")
+	if err := os.WriteFile(marker, []byte("safe"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	protectedArgs := []string{"pack", "--empty", "--output", protected}
+	stdout.Reset()
+	stderr.Reset()
+	if code := run(protectedArgs, bytes.NewReader(nil), &stdout, &stderr); code == 0 {
+		t.Fatal("pack --empty replaced a pre-existing directory")
+	}
+	data, err := os.ReadFile(marker)
+	if err != nil || string(data) != "safe" {
+		t.Fatalf("pack --empty changed protected output: %q %v", data, err)
+	}
+}
+
+func TestPackEmptyRejectsPackageInputAndAtomicReplacement(t *testing.T) {
+	for _, args := range [][]string{
+		{"pack", "--empty", "-in=packages", "--output=repo"},
+		{"pack", "packages", "--empty", "--output=repo"},
+		{"pack", "--empty", "--atomic-publish=repo"},
+	} {
+		var stdout, stderr bytes.Buffer
+		if code := run(args, bytes.NewReader(nil), &stdout, &stderr); code == 0 {
+			t.Fatalf("pack accepted conflicting empty-repository arguments %v", args)
+		}
+	}
+}
+
+func TestRemovedRepoInitCommandIsUnknown(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"repo-init"}, bytes.NewReader(nil), &stdout, &stderr); code != 2 {
+		t.Fatalf("removed command exit=%d, want 2; stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stderr.String(), `unknown command "repo-init"`) {
+		t.Fatalf("removed command did not use the normal unknown-command diagnostic: %q", stderr.String())
+	}
+	var help bytes.Buffer
+	writeGeneralHelp(&help)
+	if strings.Contains(help.String(), "repo-init") {
+		t.Fatalf("general help still advertises the removed command:\n%s", help.String())
+	}
+}
+
+func TestPackAcceptsPositionalArtifactDirectoryAndOutput(t *testing.T) {
+	if _, err := exec.LookPath("dpkg-deb"); err != nil {
+		t.Skip("dpkg-deb is required")
+	}
+	root := t.TempDir()
+	packages := filepath.Join(root, "packages")
+	packageRoot := filepath.Join(root, "package-root")
+	if err := os.MkdirAll(filepath.Join(packageRoot, "DEBIAN"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	control := "Package: tpa-cli-fixture\nVersion: 1.0\nArchitecture: all\nMaintainer: TPA Test <test@example.invalid>\nDescription: CLI positional input fixture\n"
+	if err := os.WriteFile(filepath.Join(packageRoot, "DEBIAN", "control"), []byte(control), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(packages, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	deb := filepath.Join(packages, "tpa-cli-fixture_1.0_all.deb")
+	if output, err := exec.Command("dpkg-deb", "--build", "--root-owner-group", packageRoot, deb).CombinedOutput(); err != nil {
+		t.Fatalf("dpkg-deb: %v: %s", err, output)
+	}
+	repository := filepath.Join(root, "repo")
+	args := []string{"pack", packages, "--output", repository, "-suite=stable", "-codename=bookworm", "-components=main"}
+	var stdout, stderr bytes.Buffer
+	if code := run(args, bytes.NewReader(nil), &stdout, &stderr); code != 0 {
+		t.Fatalf("positional pack exit=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	cfg := aptpackage.Config{OutDir: repository, Repo: aptpackage.RepoConfig{Suite: "stable", Codename: "bookworm", Components: "main"}}
+	if err := aptpackage.VerifyTPARepositoryTree(cfg); err != nil {
+		t.Fatalf("verify positional pack output: %v", err)
+	}
+	packagesIndex, err := os.ReadFile(filepath.Join(repository, "dists", "bookworm", "main", "binary-all", "Packages"))
+	if err != nil || !strings.Contains(string(packagesIndex), "Package: tpa-cli-fixture\n") {
+		t.Fatalf("positional package input missing from Packages: %q %v", packagesIndex, err)
+	}
+
+	emptyInput := filepath.Join(root, "empty-input")
+	if err := os.Mkdir(emptyInput, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	emptyOutput := filepath.Join(root, "empty-output")
+	stdout.Reset()
+	stderr.Reset()
+	if code := run([]string{"pack", emptyInput, "--output", emptyOutput}, bytes.NewReader(nil), &stdout, &stderr); code == 0 {
+		t.Fatal("normal pack accepted empty artifact input")
+	}
+	if _, err := os.Lstat(emptyOutput); !os.IsNotExist(err) {
+		t.Fatalf("normal pack created output for empty artifact input: %v", err)
 	}
 }
 

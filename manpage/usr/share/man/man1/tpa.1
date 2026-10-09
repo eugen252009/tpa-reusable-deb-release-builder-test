@@ -34,6 +34,8 @@ formats fall back to dpkg-deb; malformed supported archives are rejected.
 .TP
 .B pack
 Generate and verify Packages, Packages.gz, Release, and optionally InRelease.
+Use --empty for the canonical empty-repository workflow. --output accepts a
+local path or a new SSH/SFTP destination.
 .TP
 .B inspect
 Read repository Release metadata and Packages indexes from a local path or read-only HTTP(S)/SSH locator. Supports human or JSON output and exact package identity lookup.
@@ -59,6 +61,10 @@ Print the TypeScript-style JSON configuration interface.
 .B version
 Print only the TPA program version, suitable for scripts.
 .TP
+.B capabilities
+Print the versioned JSON capability and repository-format contract for
+machine consumers.
+.TP
 .B --version
 Print the human-readable program identity and version. The legacy -version spelling is also accepted.
 .TP
@@ -70,11 +76,35 @@ Print general help, command descriptions, project URL, and support contact. The 
 Input package tree, .deb path, or directory of .deb artifacts, depending on the command.
 .TP
 .BI -out " path"
-Non-atomic output path.
+Non-atomic local output path. Direct pack requires a new or empty directory;
+use --output for SSH/SFTP destinations.
+.TP
+.BI --output " destination"
+For pack, select a local output path or an SSH/SFTP destination.
+Empty initialization requires a destination that does not already exist.
+Safe local initialization uses exclusive publication on Linux, Darwin, and
+Windows; other platforms report it unsupported in the capabilities document.
 .TP
 .BI -atomic-publish " path"
-For pack, build and verify a sibling staging tree and atomically publish it at path on Linux.
-Use this mode when replacing a repository that may be read concurrently.
+For pack, build and verify a sibling staging tree and atomically publish it at a
+local path on Linux. SSH/SFTP replacement is unsupported. Use this mode when
+replacing a local repository that may be read concurrently.
+.TP
+.BI -architectures " list"
+For pack --empty, an optional comma-separated list (default all). Package
+architectures for normal pack are inferred from actual .deb files.
+.TP
+.BI -suite " name"
+APT suite value for pack; pack --empty defaults to stable.
+.TP
+.BI -components " name"
+One repository component; pack --empty defaults to main.
+.TP
+.B --empty
+For pack, initialize an empty verified repository instead of indexing package artifacts. Existing outputs are refused.
+.TP
+.BI -repo-description " text"
+Optional Release description.
 .TP
 .BI -gpg " selector"
 Select one GPG secret key. Full fingerprints are recommended. Empty means unsigned.
@@ -104,7 +134,7 @@ For inspect/verify, require and cryptographically verify a signed InRelease.
 For inspect/verify, emit one JSON document to standard output; errors remain machine-readable and return non-zero.
 .TP
 .BI -codename " name"
-Select the distribution under dists/ for inspect/verify; default is stable.
+Select the distribution under dists/ for inspect/verify; default is stable. pack --empty also defaults to codename stable.
 .TP
 .B --yes
 For delete only, explicitly approve permanent deletion in non-interactive use.
@@ -115,6 +145,10 @@ approves; the default answer is no.
 For pack, bound package inspection, source hashing during pool copy, and
 published-artifact verification concurrency. Zero (the default) uses GOMAXPROCS,
 capped at 32.
+.TP
+.BI --ssh-config " path"
+Use this OpenSSH client configuration for SSH/SFTP output. TPA still forces
+batch authentication and strict host-key checking.
 .TP
 .BI -generation-manifest " path"
 After building and verifying a repository, write a deterministic complete-file
@@ -185,18 +219,24 @@ in JSON configuration, disables only automatic generation and preserves explicit
 metadata.
 .SH REPOSITORY CORRECTNESS
 The .deb artifacts are authoritative package state. Packages, Release, and InRelease
-are derived state; no persistent package database is required. The package control stanza
+are derived state; no persistent package database is required. TPA repository-format
+v1 also requires paired, unsigned root browser sidecars; see the repository format
+and integration contract documents shipped with the source. The package control stanza
 is read from each actual .deb and preserved in Packages. Package-provided Filename, Size,
 and SHA256 fields are replaced by values derived from the published artifact.
-TPA verifies package bytes and Release index hashes before success. Signed repositories
-additionally require a valid InRelease signature from the selected full fingerprint and
-a signed payload identical to Release.
+TPA verifies indexed package bytes, package identities, and Release index hashes
+before success. Signed repositories additionally require a valid InRelease
+signature from the selected full fingerprint and a signed payload identical to
+Release. `SOURCE_DATE_EPOCH` may fix Release.Date for reproducible metadata; by
+default it uses the current UTC time. Signatures may still vary.
 .PP
 Package identity is Package plus Version plus Architecture. Byte-identical duplicate
 artifacts are indexed once. Conflicting artifacts with the same identity fail generation.
 .PP
-The input artifact directory is the desired repository snapshot. An artifact included in
-a fresh input snapshot is included in the generated repository; an omitted artifact is
+The input artifact directory is the desired repository snapshot. A normal
+pack rejects an empty artifact set; pack --empty creates a verified empty
+repository. An artifact included in a fresh input snapshot is
+included in the generated repository; an omitted artifact is
 absent. Historical versions remain available only while their .deb artifacts remain in
 that input set. Use a new or empty direct output path for exact snapshot generation.
 .SH READ-ONLY INSPECTION AND VERIFICATION
@@ -234,13 +274,46 @@ identity, and -codename/-components when the repository does not use stable/main
 Signed repositories require -gpg with the current signing key; omit it for an
 unsigned repository. A fresh pack from an input artifact set that includes an
 unlisted .deb will list it again.
+.SH SSH/SFTP OUTPUT
+.B pack --output
+accepts SCP-style destinations such as host:path (relative to the remote home)
+and ssh://[user@]host[:port]/path URLs. A URL /~/path is home-relative. TPA
+uses the OpenSSH sftp client in batch mode, the normal OpenSSH identity/config
+unless --ssh-config is supplied, and strict host-key checking. Unknown or
+changed host keys fail closed; password prompts are not supported. Each SFTP
+batch is bounded to two minutes, with earlier caller cancellation honored. The
+remote parent must already exist and resolve without symlinks.
+.PP
+TPA builds and verifies a local candidate, uploads it to a private sibling
+staging directory, checks the remote inventory and file types/sizes, reads every
+file back, verifies TPA repository-format v1, renames the complete candidate to
+a new destination, and verifies the activated tree again. Existing remote paths
+are always refused; replacement is unsupported. A TPA sibling lock serializes
+TPA publishers only. The remote parent must exclude out-of-band writers because
+SFTP server rename behavior and atomic visibility are server-dependent. The
+backend does not provide hosted authorization, quotas, managed signing, an
+upload service, or HTTP serving.
+.PP
+On an activation error, diagnostics include the phase and whether publication
+was not activated, activated, or is unknown. For activation-unknown, inspect
+and verify the final and staging paths before retrying; TPA preserves the lock
+and candidate because it cannot safely infer the outcome.
 .SH ATOMIC PUBLICATION
-Atomic publication uses a fresh sibling staging directory, complete generation and
-verification, a Linux rename exchange, and replaced-tree cleanup. A persistent hidden
+Atomic publication first verifies any existing live destination as a complete
+TPA repository. A signed destination requires -gpg to verify its current signer;
+key rotation requires a separate migration. Arbitrary directories and symlinks
+are never exchanged. It then
+uses a fresh sibling staging directory, complete generation and verification, a
+Linux rename exchange, and replaced-tree cleanup. A persistent hidden
 sibling lock file serializes TPA atomic writers and lifecycle changes; do not remove it
 while TPA writers may be active. Failure before exchange leaves the previous live
-repository unchanged. Repository data is published readable but not writable by readers;
-GPG key material is not stored in the repository tree.
+repository unchanged. If parent-directory syncing fails after exchange,
+AtomicPack returns AtomicPublishError with Published=true: the new tree is
+already active, but durability of the activation rename is uncertain. It also classifies a
+replaced-tree cleanup failure after activation and retains the
+old tree for cleanup recovery. Inspect and verify the live path before retrying.
+Repository data is published readable but not writable by readers; GPG key
+material is not stored in the repository tree.
 .SH EXAMPLES
 .nf
 tpa init -name=meta -ver=1.0 -arch=all \
@@ -248,6 +321,13 @@ tpa init -name=meta -ver=1.0 -arch=all \
   -desc='Meta package' -depends='base (= 1.0)' -out=build/meta
 
 tpa build -in=build/meta -out=dist/meta_1.0_all.deb
+
+tpa pack --empty --output=repo -suite=stable -codename=stable \
+  -components=main -architectures=amd64,arm64
+
+tpa pack --empty --output=ssh://repo-user@repo-host/srv/apt/example \
+  --ssh-config=$HOME/.ssh/config -suite=stable -codename=stable \
+  -components=main -architectures=amd64,arm64
 
 tpa pack -in=dist -atomic-publish=/srv/apt/example \
   -gpg=FULL_SIGNING_FINGERPRINT

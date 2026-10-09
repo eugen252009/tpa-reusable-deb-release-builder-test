@@ -12,7 +12,7 @@ actual package artifacts.
 - Language: Go 1.26.3 (`go.mod`)
 - Executable entry point: `main.go`
 - Internal implementation: `internals/aptpackage`
-- External tools: `dpkg-deb`, `gzip`, and optionally `gpg`
+- External tools: `dpkg-deb`, `gzip`, OpenSSH `ssh`/`sftp` for SSH transport, and optionally `gpg`
 - Atomic replacement: Linux `renameat2(RENAME_EXCHANGE)`
 - Release script: `build.sh`
 - Release architectures: `amd64`, `arm64`, and `riscv64`
@@ -25,7 +25,8 @@ actual package artifacts.
 | `init` | Creates `DEBIAN/`, `usr/local/bin/`, control metadata, and executable maintainer scripts. |
 | `build` | Validates `DEBIAN/control`, fixes present maintainer-script modes, and invokes `dpkg-deb --root-owner-group --build`. |
 | `parse` | Reads plain, gzip, and xz control archives in-process; typed unsupported formats fall back to `dpkg-deb -f`, while malformed supported inputs fail directly. |
-| `pack` | Derives and verifies an APT repository from top-level `.deb` files. |
+| `pack` | Derives and verifies an APT repository from top-level `.deb` files; `--empty` is the canonical empty workflow. Local and SSH/SFTP output are supported; remote output is new-destination-only. |
+| `capabilities` | Prints the versioned machine-readable TPA capability/repository-format contract. |
 | `inspect` | Reads local, HTTP(S), or SSH repository metadata/indexes without mutation; supports JSON and exact identity lookup. |
 | `verify` | Verifies Release/index hashes, public-key InRelease signatures, artifact bytes, and package identity. |
 | `unlist` | Removes one exact `Package + Version + Architecture` identity from APT metadata, verifies and atomically publishes metadata, and retains the `.deb`. |
@@ -67,11 +68,22 @@ return non-zero and write diagnostics to standard error.
 - Pack worker queues and the ordered inspection window remain bounded; worker
   changes must preserve deterministic indexes, artifact-derived hashes, and
   independent repository verification.
+- TPA repository format v1 requires paired root `index.html` and `repository.json`
+  sidecars generated from APT indexes; these are convenience metadata, not signed
+  APT trust data. `VerifyTPARepositoryTree` validates them; generic `verify`
+  remains compatible with ordinary APT repositories without them.
+- SSH/SFTP output builds and verifies a local candidate, uploads through OpenSSH SFTP, reads the remote tree back, verifies it, and activates only a new remote path. Existing remote replacement is unsupported. The TPA sibling lock serializes cooperating TPA publishers only; the remote parent must exclude out-of-band writers. Activation atomicity is SFTP-server-dependent and must be reported honestly.
+- `tpa capabilities` is the versioned machine-readable integration contract and
+  must report standalone transport and hosted-publication boundaries accurately.
 
-`Pack` supports direct generation. Use `AtomicPack`/`--atomic-publish` when an
-existing repository may be read concurrently: TPA builds a sibling staging
-tree, verifies it, exchanges it with the live directory, and removes the
-replaced tree. Failure before exchange leaves the previous tree unchanged.
+`Pack` supports direct generation and the canonical `pack --empty` initialization
+mode. Use `AtomicPack`/`--atomic-publish` for
+local replacement when an existing repository may be read concurrently; remote
+`--output` does not support replacement. TPA verifies any existing live
+TPA tree (including its signature with the selected current signer when signed),
+builds a sibling staging tree, verifies it, exchanges it with the live
+directory, and removes the replaced tree. Failure before exchange leaves the
+previous tree unchanged; post-activation errors must report `Published=true`.
 
 ## Data Model
 
@@ -97,9 +109,11 @@ are normalized into `Config.Scripts`.
 go build -o tpa .
 go test -race ./...
 go vet ./...
-./tests/version-qualification.sh
 ./tests/qualification.sh
+./tests/repository-contract-qualification.sh
+./tests/ssh-output-qualification.sh
 ./tests/dependency-qualification.sh
+./tests/version-qualification.sh
 ```
 
 The signed qualification requires Docker, GPG, `dpkg-deb`, and Go. It verifies
@@ -139,6 +153,6 @@ manpage artifacts.
 - Prefer the Go standard library and explicit error handling.
 - Keep control files readable (`0644`) and maintainer scripts executable
   (`0755`).
-- Run gofmt, race tests, vet, and all three qualification scripts after relevant changes.
+- Run gofmt, race tests, vet, and the relevant qualification scripts after changes.
 - Treat `.deb` archives and APT metadata as externally consumed formats.
 - Do not weaken verification or artifact-derived hashing for performance.

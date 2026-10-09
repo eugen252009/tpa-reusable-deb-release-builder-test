@@ -17,9 +17,36 @@ type releaseChecksum struct {
 	Size   int64
 }
 
+// VerifyTPARepositoryTree verifies the APT trust chain and requires the paired,
+// canonical TPA browser sidecars. cfg.Repo must describe the expected release
+// metadata; cfg.GPG, when set, selects the expected InRelease signer. Generic
+// repository readers intentionally do not require these TPA-specific files.
+func VerifyTPARepositoryTree(cfg Config) error {
+	if cfg.OutDir == "" {
+		return fmt.Errorf("repository path is empty")
+	}
+	if err := validateRepositoryTree(cfg.OutDir); err != nil {
+		return err
+	}
+	if err := validateTPARepositoryLayout(cfg); err != nil {
+		return err
+	}
+	if err := verifyRepositoryWithIdentity(cfg, true); err != nil {
+		return err
+	}
+	if err := verifyRepositoryBrowserFiles(cfg.OutDir, cfg.Repo, true); err != nil {
+		return fmt.Errorf("verify repository browser sidecars: %w", err)
+	}
+	return nil
+}
+
 // verifyRepository verifies the complete chain from indexed package artifacts
 // through Release and, when configured, the InRelease signature.
 func verifyRepository(cfg Config) error {
+	return verifyRepositoryWithIdentity(cfg, false)
+}
+
+func verifyRepositoryWithIdentity(cfg Config, verifyIdentity bool) error {
 	workers, err := packWorkerCount(cfg.Workers)
 	if err != nil {
 		return err
@@ -36,7 +63,7 @@ func verifyRepository(cfg Config) error {
 	distDir := filepath.Join(repoRoot, "dists", codename)
 	releasePath := filepath.Join(distDir, "Release")
 	releaseParseStage := startStage(stageVerifyReleaseParse)
-	releaseData, err := os.ReadFile(releasePath)
+	releaseData, err := readRepositoryTreeFile(releasePath, maxRepositoryReleaseBytes)
 	if err != nil {
 		releaseParseStage()
 		return fmt.Errorf("read Release: %w", err)
@@ -49,6 +76,10 @@ func verifyRepository(cfg Config) error {
 
 	releaseFilesStage := startStage(stageVerifyReleaseFiles)
 	for rel, expected := range releaseChecksums {
+		if expected.Size < 0 || expected.Size > maxRepositoryIndexBytes {
+			releaseFilesStage()
+			return fmt.Errorf("Release index %s exceeds %d bytes", rel, maxRepositoryIndexBytes)
+		}
 		path, err := safeRepositoryPath(distDir, rel)
 		if err != nil {
 			releaseFilesStage()
@@ -79,7 +110,7 @@ func verifyRepository(cfg Config) error {
 			}
 		}
 		packagesPath := filepath.Join(componentDir, entry.Name(), "Packages")
-		if err := verifyPackageIndex(repoRoot, packagesPath, workers); err != nil {
+		if err := verifyPackageIndex(repoRoot, packagesPath, workers, verifyIdentity); err != nil {
 			return fmt.Errorf("verify %s: %w", filepath.ToSlash(filepath.Join(component, entry.Name(), "Packages")), err)
 		}
 	}
@@ -88,6 +119,13 @@ func verifyRepository(cfg Config) error {
 	}
 
 	inReleasePath := filepath.Join(distDir, "InRelease")
+	if info, err := os.Lstat(inReleasePath); err == nil {
+		if !info.Mode().IsRegular() || info.Size() > maxRepositorySignatureSize {
+			return fmt.Errorf("InRelease has an invalid type or exceeds %d bytes", maxRepositorySignatureSize)
+		}
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("inspect InRelease: %w", err)
+	}
 	if cfg.GPG == "" {
 		if _, err := os.Stat(inReleasePath); err == nil {
 			return fmt.Errorf("unsigned repository contains stale InRelease")
@@ -116,9 +154,9 @@ func parseReleaseChecksums(data []byte) (map[string]releaseChecksum, error) {
 	return checksums, err
 }
 
-func verifyPackageIndex(repoRoot, packagesPath string, workers int) error {
+func verifyPackageIndex(repoRoot, packagesPath string, workers int, verifyIdentity bool) error {
 	indexParseStage := startStage(stageVerifyIndexReadParse)
-	data, err := os.ReadFile(packagesPath)
+	data, err := readRepositoryTreeFile(packagesPath, maxRepositoryIndexBytes)
 	if err != nil {
 		indexParseStage()
 		return err
@@ -135,12 +173,24 @@ func verifyPackageIndex(repoRoot, packagesPath string, workers int) error {
 	artifactStage := startStage(stageVerifyArtifacts)
 	err = runPackageJobs(len(entries), workers, func(index int) error {
 		entry := entries[index]
+		if entry.Size <= 0 || entry.Size > maxRepositoryArtifactBytes {
+			return fmt.Errorf("entry %d artifact size is outside the supported range", index+1)
+		}
 		artifactPath, err := safeRepositoryPath(repoRoot, entry.Filename)
 		if err != nil {
 			return fmt.Errorf("entry %d has invalid Filename: %w", index+1, err)
 		}
 		if err := verifyFile(artifactPath, entry.Size, entry.SHA256); err != nil {
 			return fmt.Errorf("entry %d artifact %s: %w", index+1, entry.Filename, err)
+		}
+		if verifyIdentity {
+			control, err := ParsePackage(artifactPath)
+			if err != nil {
+				return fmt.Errorf("entry %d artifact %s control: %w", index+1, entry.Filename, err)
+			}
+			if packageIdentity(control) != (PackageIdentity{Package: entry.Package, Version: entry.Version, Architecture: entry.Architecture}) {
+				return fmt.Errorf("entry %d artifact %s package identity does not match Packages", index+1, entry.Filename)
+			}
 		}
 		return nil
 	})

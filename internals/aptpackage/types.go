@@ -129,6 +129,10 @@ type Config struct {
 	// Workers limits independent package-local repository work. It is a Go/CLI
 	// execution option, not repository metadata or JSON configuration.
 	Workers int `json:"-"`
+
+	// emptyRepositoryArchitectures is set only by InitializeRepository. It is
+	// deliberately not part of the package/JSON configuration contract.
+	emptyRepositoryArchitectures []string
 }
 
 var knownJSONControlKeys = map[string]bool{

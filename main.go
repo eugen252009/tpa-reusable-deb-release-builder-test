@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 
 	"github.com/eugen252009/tpa/internal/version"
 	"github.com/eugen252009/tpa/internals/aptpackage"
@@ -32,6 +33,7 @@ var publicCommands = []commandDescription{
 	{"parse", "Read package metadata"},
 	{"pack", "Build an APT repository"},
 	{"inspect", "Inspect an existing repository"},
+	{"capabilities", "Print machine-readable TPA capabilities"},
 	{"verify", "Verify an existing repository"},
 	{"unlist", "Remove a package from repository metadata"},
 	{"delete", "Unlist and permanently remove a package artifact"},
@@ -81,6 +83,95 @@ func commandFailure(output io.Writer, message string) int {
 	return 1
 }
 
+func parseRepositoryArchitectures(value string) ([]string, error) {
+	if strings.TrimSpace(value) == "" {
+		return nil, fmt.Errorf("-architectures must be a comma-separated non-empty list")
+	}
+	parts := strings.Split(value, ",")
+	architectures := make([]string, 0, len(parts))
+	seen := make(map[string]bool, len(parts))
+	for _, part := range parts {
+		architecture := strings.TrimSpace(part)
+		if architecture == "" {
+			return nil, fmt.Errorf("-architectures contains an empty value")
+		}
+		if seen[architecture] {
+			return nil, fmt.Errorf("-architectures repeats %q", architecture)
+		}
+		seen[architecture] = true
+		architectures = append(architectures, architecture)
+	}
+	return architectures, nil
+}
+
+func buildAndPublishRepository(cfg aptpackage.Config, destination aptpackage.RepositoryDestination, empty bool, architectures []string, atomicPath, sshConfigPath string, progress io.Writer) (string, bool, func() error, error) {
+	if atomicPath != "" {
+		if sshConfigPath != "" {
+			return "", false, nil, fmt.Errorf("--ssh-config is only valid for SSH/SFTP output")
+		}
+		atomicDestination, err := aptpackage.ParseRepositoryDestination(atomicPath)
+		if err != nil {
+			return "", false, nil, fmt.Errorf("parse atomic publication path: %w", err)
+		}
+		if atomicDestination.Kind != aptpackage.DestinationLocal {
+			return "", false, nil, fmt.Errorf("--atomic-publish supports local filesystem paths only; SSH replacement is unsupported")
+		}
+		if empty {
+			return "", false, nil, fmt.Errorf("--atomic-publish cannot be used with an empty repository")
+		}
+		cfg.OutDir = atomicDestination.LocalPath
+		if err := aptpackage.AtomicPack(cfg, cfg.OutDir); err != nil {
+			return "", false, nil, err
+		}
+		return cfg.OutDir, false, nil, nil
+	}
+	if destination.Kind == aptpackage.DestinationLocal {
+		if sshConfigPath != "" {
+			return "", false, nil, fmt.Errorf("--ssh-config is only valid for SSH/SFTP output")
+		}
+		cfg.OutDir = destination.LocalPath
+		if empty {
+			if err := aptpackage.InitializeRepository(cfg, architectures); err != nil {
+				return "", false, nil, err
+			}
+		} else if err := aptpackage.Pack(cfg); err != nil {
+			return "", false, nil, err
+		}
+		return cfg.OutDir, false, nil, nil
+	}
+	if progress != nil {
+		fmt.Fprintf(progress, "Building local repository candidate for %s.\n", cfg.OutDir)
+	}
+	candidateParent, err := os.MkdirTemp("", ".tpa-ssh-candidate-*")
+	if err != nil {
+		return "", false, nil, fmt.Errorf("create local SSH publication candidate: %w", err)
+	}
+	cleanup := func() error { return os.RemoveAll(candidateParent) }
+	cfg.OutDir = filepath.Join(candidateParent, "repository")
+	if empty {
+		err = aptpackage.InitializeRepository(cfg, architectures)
+	} else {
+		err = aptpackage.Pack(cfg)
+	}
+	if err != nil {
+		_ = cleanup()
+		return "", true, nil, err
+	}
+	destination.SSHConfigPath = sshConfigPath
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+	phaseProgress := func(phase aptpackage.RemotePublishPhase) {
+		if progress != nil {
+			fmt.Fprintf(progress, "SSH publication: %s\n", phase)
+		}
+	}
+	if err := aptpackage.PublishRepositoryToSSHWithProgress(ctx, cfg, destination, phaseProgress); err != nil {
+		_ = cleanup()
+		return "", true, nil, err
+	}
+	return cfg.OutDir, true, cleanup, nil
+}
+
 func unknownCommand(output io.Writer, command string) int {
 	writeIdentityHeader(output)
 	fmt.Fprintf(output, "\nerror: unknown command %q\n\nUsage:\n  tpa <command> [options]\n\nRun 'tpa --help' for more information.\n", command)
@@ -116,6 +207,17 @@ func runWithTerminal(args []string, stdin io.Reader, stdout, stderr io.Writer, i
 	if !isPublicCommand(command) {
 		return unknownCommand(stderr, command)
 	}
+	if command == "capabilities" {
+		if len(args) != 1 {
+			return usageError(stderr, "capabilities does not accept arguments")
+		}
+		encoder := json.NewEncoder(stdout)
+		encoder.SetIndent("", "  ")
+		if err := encoder.Encode(aptpackage.GetCapabilities()); err != nil {
+			return commandFailure(stderr, fmt.Sprintf("write capabilities: %v", err))
+		}
+		return 0
+	}
 	cfg := aptpackage.Config{}
 	flags := flag.NewFlagSet("tpa", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
@@ -148,13 +250,17 @@ func runWithTerminal(args []string, stdin io.Reader, stdout, stderr io.Writer, i
 	flags.StringVar(&cfg.Repo.Suite, "suite", "stable", "Repository Suite")
 	flags.StringVar(&cfg.Repo.Components, "components", "main", "Components (e.g. main)")
 	flags.StringVar(&cfg.Repo.Codename, "codename", "stable", "Distribution Codename")
+	flags.StringVar(&cfg.Repo.Description, "repo-description", "", "Repository description")
+	architectures := flags.String("architectures", "", "Comma-separated repository architectures for pack --empty")
+	emptyRepository := flags.Bool("empty", false, "Create an empty APT repository instead of indexing packages")
 	flags.StringVar(&cfg.InDir, "in", ".", "Your input directory")
 	packageName := flags.String("package", "", "Package name for unlist/delete or exact inspect lookup")
 	flags.StringVar(&cfg.OutDir, "out", ".", "Output directory for the .deb file")
 	flags.StringVar(&cfg.GPG, "gpg", "", "GPG Key ID or full fingerprint for signing, empty for no signing")
 	workers := flags.Int("workers", 0, "Bounded package workers for pack (0 uses GOMAXPROCS)")
-	output := flags.String("output", "", "Repository output directory (alias for -out)")
+	output := flags.String("output", "", "Repository output path or SSH destination (alias for -out)")
 	atomicPublish := flags.String("atomic-publish", "", "Atomically publish the repository at this path")
+	sshConfig := flags.String("ssh-config", "", "OpenSSH client config for SSH/SFTP output")
 	generationManifest := flags.String("generation-manifest", "", "Write a portable inventory for the verified repository generation")
 	repositoryID := flags.String("repository-id", "", "Repository identity for -generation-manifest")
 	generationID := flags.String("generation-id", "", "Generation identity for -generation-manifest")
@@ -179,27 +285,60 @@ func runWithTerminal(args []string, stdin io.Reader, stdout, stderr io.Writer, i
 	if err := flags.Parse(flagArgs); err != nil {
 		return usageError(stderr, err.Error())
 	}
+	seenFlags := make(map[string]bool)
+	flags.Visit(func(f *flag.Flag) { seenFlags[f.Name] = true })
 	if command == "pack" {
-		if *output != "" && *atomicPublish != "" {
-			return usageError(stderr, "--output and --atomic-publish are mutually exclusive")
+		if seenFlags["output"] && seenFlags["out"] {
+			return usageError(stderr, "-out and --output cannot be used together")
+		}
+		if seenFlags["atomic-publish"] && (seenFlags["output"] || seenFlags["out"]) {
+			return usageError(stderr, "--atomic-publish cannot be combined with -out or --output")
 		}
 		positional := flags.Args()
 		if len(positional) > 1 {
-			return usageError(stderr, "pack accepts at most one JSON config path")
+			return usageError(stderr, "pack accepts at most one input directory or JSON config path")
 		}
-		if len(positional) == 1 {
-			data, err := os.ReadFile(positional[0])
-			if err != nil {
-				return usageError(stderr, fmt.Sprintf("read config: %v", err))
+		if *emptyRepository {
+			if len(positional) != 0 || seenFlags["in"] {
+				return usageError(stderr, "pack --empty does not accept package input")
 			}
-			if err := json.Unmarshal(data, &cfg); err != nil {
-				return usageError(stderr, fmt.Sprintf("parse config: %v", err))
+			if seenFlags["atomic-publish"] {
+				return usageError(stderr, "pack --empty cannot replace an existing repository")
+			}
+		} else {
+			if seenFlags["architectures"] {
+				return usageError(stderr, "-architectures is only valid with pack --empty")
+			}
+			if len(positional) == 1 {
+				if seenFlags["in"] {
+					return usageError(stderr, "pack input directory cannot be specified both positionally and with -in")
+				}
+				info, statErr := os.Stat(positional[0])
+				if statErr != nil {
+					return usageError(stderr, fmt.Sprintf("read pack input %s: %v", positional[0], statErr))
+				}
+				if info.IsDir() {
+					cfg.InDir = positional[0]
+				} else {
+					data, readErr := os.ReadFile(positional[0])
+					if readErr != nil {
+						return usageError(stderr, fmt.Sprintf("read config: %v", readErr))
+					}
+					if err := json.Unmarshal(data, &cfg); err != nil {
+						return usageError(stderr, fmt.Sprintf("parse config: %v", err))
+					}
+				}
 			}
 		}
-		if *output != "" {
+		if seenFlags["in"] {
+			cfg.InDir = flags.Lookup("in").Value.String()
+		}
+		if seenFlags["output"] {
 			cfg.OutDir = *output
+		} else if seenFlags["out"] {
+			cfg.OutDir = flags.Lookup("out").Value.String()
 		}
-		if *atomicPublish != "" {
+		if seenFlags["atomic-publish"] {
 			cfg.OutDir = *atomicPublish
 		}
 		if *workers < 0 || *workers > aptpackage.MaxPackWorkers {
@@ -212,8 +351,12 @@ func runWithTerminal(args []string, stdin io.Reader, stdout, stderr io.Writer, i
 		cfg.Provenance = &disabled
 	}
 
-	seenFlags := make(map[string]bool)
-	flags.Visit(func(f *flag.Flag) { seenFlags[f.Name] = true })
+	if seenFlags["ssh-config"] && command != "pack" {
+		return usageError(stderr, "--ssh-config is only valid with pack")
+	}
+	if seenFlags["empty"] && command != "pack" {
+		return usageError(stderr, "--empty is only valid with pack")
+	}
 	if seenFlags["yes"] && command != "delete" {
 		return usageError(stderr, "--yes is only valid with delete")
 	}
@@ -244,37 +387,74 @@ func runWithTerminal(args []string, stdin io.Reader, stdout, stderr io.Writer, i
 		}
 		fmt.Fprintln(stdout, pkg)
 	case "pack":
-		var err error
-		if *atomicPublish != "" {
-			err = aptpackage.AtomicPack(cfg, *atomicPublish)
-		} else {
-			err = aptpackage.Pack(cfg)
+		if seenFlags["empty"] && !*emptyRepository {
+			return usageError(stderr, "--empty must be enabled to use this option")
 		}
+		destination, err := aptpackage.ParseRepositoryDestination(cfg.OutDir)
+		if err != nil {
+			return usageError(stderr, fmt.Sprintf("invalid repository output: %v", err))
+		}
+		destination.SSHConfigPath = *sshConfig
+		architectureList := []string{"all"}
+		if seenFlags["architectures"] {
+			architectureList, err = parseRepositoryArchitectures(*architectures)
+			if err != nil {
+				return usageError(stderr, err.Error())
+			}
+		}
+		repositoryRoot, remote, cleanup, err := buildAndPublishRepository(cfg, destination, *emptyRepository, architectureList, *atomicPublish, *sshConfig, stdout)
 		if err != nil {
 			return commandFailure(stderr, fmt.Sprintf("repository build failed: %v", err))
 		}
 		if *generationManifest != "" {
 			manifestPath, pathErr := filepath.Abs(*generationManifest)
-			rootPath, rootErr := filepath.Abs(cfg.OutDir)
+			rootPath, rootErr := filepath.Abs(repositoryRoot)
 			if pathErr != nil || rootErr != nil {
+				if cleanup != nil {
+					_ = cleanup()
+				}
 				return commandFailure(stderr, "resolve generation manifest path failed")
 			}
 			rel, relErr := filepath.Rel(rootPath, manifestPath)
 			if relErr != nil || rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))) {
+				if cleanup != nil {
+					_ = cleanup()
+				}
 				return usageError(stderr, "generation manifest must be outside the repository tree")
 			}
-			manifest, manifestErr := aptpackage.CreateGenerationManifest(cfg.OutDir, *repositoryID, *generationID, *parentGeneration)
+			manifest, manifestErr := aptpackage.CreateGenerationManifest(repositoryRoot, *repositoryID, *generationID, *parentGeneration)
 			if manifestErr == nil {
-				manifestErr = aptpackage.VerifyGenerationManifest(cfg.OutDir, manifest, *repositoryID)
+				manifestErr = aptpackage.VerifyGenerationManifest(repositoryRoot, manifest, *repositoryID)
 			}
 			if manifestErr == nil {
 				manifestErr = aptpackage.WriteGenerationManifest(manifestPath, manifest)
 			}
 			if manifestErr != nil {
+				if cleanup != nil {
+					_ = cleanup()
+				}
+				if remote {
+					return commandFailure(stderr, fmt.Sprintf("repository is published and verified remotely, but generation manifest creation failed: %v", manifestErr))
+				}
 				return commandFailure(stderr, fmt.Sprintf("create generation manifest: %v", manifestErr))
 			}
 		}
-		fmt.Fprintln(stdout, "Repo build complete!")
+		if cleanup != nil {
+			if err := cleanup(); err != nil {
+				return commandFailure(stderr, fmt.Sprintf("repository is published and verified, but local candidate cleanup failed: %v", err))
+			}
+		}
+		if remote {
+			if *emptyRepository {
+				fmt.Fprintf(stdout, "Empty repository initialized and verified at %s.\n", cfg.OutDir)
+			} else {
+				fmt.Fprintf(stdout, "Repo build complete and verified at %s.\n", cfg.OutDir)
+			}
+		} else if *emptyRepository {
+			fmt.Fprintf(stdout, "Empty repository initialized at %s.\n", repositoryRoot)
+		} else {
+			fmt.Fprintln(stdout, "Repo build complete!")
+		}
 	case "json":
 		data, err := io.ReadAll(stdin)
 		if err != nil {

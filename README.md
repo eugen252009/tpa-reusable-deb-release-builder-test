@@ -16,8 +16,9 @@ package database or metadata cache.
 - `dpkg-deb` for package building and fallback inspection of unsupported `.deb` formats
 - `gzip` for compressed package indexes
 - `gpg` when signing repositories or verifying `InRelease` signatures
+- `ssh` for read-only SSH inspection; `sftp` for SSH output
 - Linux and a filesystem supporting `renameat2(RENAME_EXCHANGE)` for replacing
-  an existing repository atomically
+  an existing local repository atomically
 
 Build a development binary with:
 
@@ -42,7 +43,7 @@ the same help and returns status 2.
 | `init` | Package metadata flags | Package root at `-out`, including `DEBIAN/control`, maintainer scripts, and `usr/local/bin` |
 | `build` | Package root at `-in` | `.deb` archive or destination directory at `-out`, using `dpkg-deb --root-owner-group --build` |
 | `parse` | `.deb` archive at `-in` | Human-readable parsed control summary on standard output |
-| `pack` | Top-level `.deb` files in `-in`, or an optional JSON config path | Verified APT repository at `-out`, `--output`, or `--atomic-publish`; optionally a generation inventory |
+| `pack` | Top-level `.deb` files in `-in`, an optional JSON config path, or `--empty` | Verified APT repository at local or SSH/SFTP `--output`, or local `--atomic-publish`; optionally a generation inventory |
 | `inspect` | Local repository path or read-only HTTP(S)/SSH locator | Release metadata and rich package-index entries; optionally exact `-package`, `-ver`, `-arch` lookup |
 | `verify` | Local repository path or read-only HTTP(S)/SSH locator | Verifies Release/index integrity, signatures when present, and every indexed `.deb` artifact |
 | `unlist` | Repository at `-in` and exact `-package`, `-ver`, `-arch` identity | Atomically removes that identity from APT metadata and retains its `.deb` |
@@ -50,6 +51,7 @@ the same help and returns status 2.
 | `json` | Configuration JSON on standard input | Initialized package root at JSON `outdir` |
 | `schema` | None | TypeScript-style configuration interface on standard output |
 | `version` | None | TPA program version on standard output |
+| `capabilities` | None | Versioned machine-readable capability and repository-format contract |
 
 `tpa version` prints only the version for scripts. `tpa --version` (also
 `tpa -version`) prints `tpa <version>`. Help identifies the project as
@@ -79,10 +81,16 @@ Package flags include `-name`, `-ver`, `-arch`, `-maintainer`, `-desc`,
 `-built-using`, `-essential`, `-multi-arch`, `-preinst`, `-postinst`, `-prerm`,
 and `-postrm`.
 
-Repository flags include `-origin`, `-label`, `-suite`, `-codename`, and
-`-components`. Lifecycle commands use `-package`, `-ver`, and `-arch` for the
-canonical package identity and `-in` for the existing repository tree. For a
-non-default distribution or component, set `-codename` and `-components` to
+Repository flags include `-origin`, `-label`, `-suite`, `-codename`,
+`-components`, and `-repo-description`. Canonical empty initialization is
+`tpa pack --empty`; `-architectures` defaults to `all` there and accepts a
+comma-separated override. `pack --empty` defaults to suite/codename `stable`
+and component `main`; these Release fields can be overridden. It refuses existing
+output destinations. Safe local initialization is supported on Linux, Darwin,
+and Windows; `tpa capabilities` reports platform support. Lifecycle commands use
+`-package`, `-ver`, and `-arch` for the canonical package identity and `-in`
+for the existing repository tree. For
+a non-default distribution or component, set `-codename` and `-components` to
 match that tree. Read-only `inspect` and `verify` take one repository locator
 positionally and use `-codename` (default `stable`) to select the distribution.
 `delete` accepts `--yes` for explicit non-interactive approval;
@@ -90,15 +98,22 @@ without it, deletion requires a terminal and accepts only `y` or `yes` (case
 insensitive). `-gpg` is required for a signed repository and must select its
 signer. The `pack` command's `-workers` option bounds package inspection,
 source hashing during pool copy, and published-artifact verification; zero (the
-default) derives the worker count from `GOMAXPROCS`, capped at 32. Repository architectures are inferred from the actual `.deb`
-artifacts; there is no architecture-list override. `-gpg` selects a signing key.
-The general path flags are `-in` and `-out`. For `pack`, `--output` is an alias
-for `-out`, while `--atomic-publish` selects atomic replacement; those two
-output overrides cannot be used together. For hosted prebuilt publication,
-`-generation-manifest`, `-repository-id`, and `-generation-id` write a versioned
-inventory after repository verification; `-parent-generation` binds the expected
-active parent. Use a server-issued repository ID and a fresh 32-character
-lowercase-hex generation ID when publishing to TPA.run.
+default) derives the worker count from `GOMAXPROCS`, capped at 32. Normal `pack`
+infers repository architectures from actual `.deb` artifacts; `pack --empty`
+uses `all` by default or accepts an explicit architecture list. `-gpg` selects a signing key.
+The general path flags are `-in` and `-out`. For `pack`, `--output` accepts a
+local path or SSH destination; `--atomic-publish` is local-only and selects
+atomic replacement. SSH destinations use either `ssh://[user@]host[:port]/path`
+or SCP-style `host:path` syntax. `--ssh-config` selects an OpenSSH client config
+when needed; otherwise the OpenSSH client's normal config and identities are
+used. Unknown or changed host keys are rejected. SSH output publishes only to a
+new path; it never replaces an existing remote repository. Remote activation
+uses same-parent SFTP directory rename and requires the remote parent to exclude
+out-of-band writers. See [SSH output](docs/ssh-output.md) for guarantees and
+failure recovery. For external candidate transport, `-generation-manifest`,
+`-repository-id`, and `-generation-id` write a versioned inventory after
+repository verification; `-parent-generation` records the expected parent. The
+inventory is not authorization or publication by itself.
 
 ### Read-only repository inspection and verification
 
@@ -235,6 +250,22 @@ metadata inspectors.
 tpa pack -in=dist -out=repo
 ```
 
+Create an initially empty repository with the canonical `pack --empty`
+workflow. It refuses any existing destination:
+
+```sh
+tpa pack --empty --output=repo \
+  -suite=stable -codename=stable -components=main \
+  -architectures=amd64,arm64
+# Add the first package using the same repository settings.
+tpa pack -in=dist --atomic-publish=repo \
+  -suite=stable -codename=stable -components=main
+```
+
+`pack` without `--empty` still rejects an empty artifact directory. `SOURCE_DATE_EPOCH` may be
+set to a non-negative Unix timestamp to make `Release.Date` reproducible; the
+default is the current UTC time, and OpenPGP signatures may still vary.
+
 For the default codename and component, output has this form:
 
 ```text
@@ -249,21 +280,27 @@ repo/
 ```
 
 Opening the repository root in a browser serves a static package listing.
-The static page and JSON inventory work under an arbitrary repository URL,
-including paths such as `https://tpa.run/r/tparun/bootstrap/`; package links are
-repository-relative. `repository.json` has `format: "tpa-repository-index"`,
-`version: 1`, and a `packages` array sorted lexically by Package, Version,
-Architecture, then artifact Filename. Each entry has a `metadata` object
-preserving Debian control fields (including unknown/custom
-fields) and an `artifact` object with `filename`, numeric `size`, and `sha256`.
-The browser renders all metadata without requiring JavaScript. Lifecycle
-`unlist` operations regenerate both views from the updated APT indexes. These
-root-level browsing files are convenience sidecars; APT's signed `Release`
-metadata continues to cover the APT indexes as before.
+The static page and JSON inventory use repository-relative package links.
+`repository.json` has `format: "tpa-repository-index"`, `version: 1`, and a
+`packages` array sorted lexically by Package, Version, Architecture, then
+artifact Filename. Each entry has a `metadata` object preserving Debian control
+fields (including unknown/custom fields) and an `artifact` object with
+`filename`, numeric `size`, and `sha256`. Empty repositories use an empty
+`packages` array. The browser renders all metadata without JavaScript.
+Lifecycle `unlist` operations regenerate both views from the updated APT
+indexes. These root-level files are an inseparable convenience pair, not APT
+trust metadata: they are not covered by `Release` or `InRelease`. See
+[`docs/repository-format-v1.md`](docs/repository-format-v1.md) for the strict
+format and independent-consumer requirements.
 
-`-out` and `--output` select direct, non-atomic output. Use a new or empty path
-when the result must be an exact snapshot. Direct output remains useful for
-manual generation where no concurrent reader observes the destination.
+Local `-out` and `--output` select direct, non-atomic output and require a new
+or empty path. Use `--atomic-publish` to replace a live local repository. Empty
+repository initialization is `tpa pack --empty`. For remote SSH/SFTP output,
+TPA builds and verifies a local
+candidate, uploads and reads it back, then activates only a new destination.
+Existing remote destinations are deliberately unsupported because generic SFTP
+cannot safely replace a populated repository. Normal `pack` still rejects
+empty artifact input.
 
 For a completed repository, `-generation-manifest=<path>` writes a deterministic
 versioned file inventory outside the repository tree. It requires
@@ -383,29 +420,21 @@ result. It rejects expired, revoked, invalid, or ambiguous signature status and
 requires the InRelease signature block to end the file. Key creation, storage,
 expiration, and rotation remain GPG concerns.
 
-## Exporting a hosted generation
+## Hosted integration boundary
 
-TPA.run accepts complete repository trees built and signed by TPA. Register the
-APT public key for the target repository with TPA.run, then build a fresh
-repository tree and inventory:
+`tpa capabilities` emits a versioned JSON contract
+for automation, including the repository format, browser sidecars, supported
+operations, readers, signing, and publication/transport boundaries. The
+transport-independent candidate contract is documented in
+[`docs/tparun-integration-contract.md`](docs/tparun-integration-contract.md).
 
-```sh
-gpg --armor --export "$APT_FINGERPRINT" > apt-signing-public.asc
-tparun signer add "$REPOSITORY_ID" apt-signing-public.asc
-tpa pack -in=artifacts -out=repo-generation -gpg="$APT_FINGERPRINT" \
-  -generation-manifest=generation.json \
-  -repository-id="$REPOSITORY_ID" \
-  -generation-id="$(openssl rand -hex 16)" \
-  -parent-generation="$ACTIVE_GENERATION"
-tparun publish-generation "$REPOSITORY_ID" \
-  --directory repo-generation --manifest generation.json
-```
-
-Omit `-parent-generation` when the repository has no active generation. Keep
-the inventory beside, not inside, the generation tree. TPA.run authenticates
-the publisher, checks the inventory and signed APT metadata independently,
-then stores and activates the immutable generation. Its existing managed-signing
-`tparun publish` flow remains available.
+Standalone TPA builds and verifies repository candidates and can publish one
+outbound over SSH/SFTP to a new remote path. It does not implement hosted
+authorization, quotas, managed key custody, or a hosted publication service. Any future hosted integration must submit candidates through TPA.run's
+authorized `stage` / `status` / `publish` workflow after independent server-side
+validation. It must never write directly to hosted live storage or pass a hosted
+private signing key to the TPA build. Compatibility with a particular TPA.run
+source/binary baseline is **NOT VERIFIED** by this standalone qualification.
 
 ## Atomic publication
 
@@ -417,18 +446,27 @@ tpa pack -in=dist -atomic-publish=/srv/apt/example \
   -gpg=FULL_SIGNING_FINGERPRINT
 ```
 
-On Linux, TPA performs:
+When the destination exists, `AtomicPack` first verifies that it is a complete
+TPA format-v1 repository (including sidecars and the current signature if
+signed); for a signed destination, `-gpg` must verify its current signer. Key
+rotation requires a separately verified migration. Arbitrary directories and
+symlinks are never exchanged. On Linux, TPA then performs:
 
 ```text
 fresh sibling staging tree
 → complete generation
-→ repository verification
+→ repository verification, including paired sidecars
 → atomic rename exchange
 → replaced-tree cleanup
 ```
 
 Failure before the exchange removes staging and leaves the previous repository
-unchanged. Repository directories are published as `0755` and files as `0644`.
+unchanged. A parent-directory sync failure after activation returns a typed
+`AtomicPublishError` with `Published == true`: the new tree is active, but
+durability of the activation rename is uncertain. Failure to remove the replaced tree is also reported
+with `Published == true`; the old tree is retained at its staging path for
+cleanup recovery. Do not blindly retry either case; inspect and verify the live
+path first. Repository directories are published as `0755` and files as `0644`.
 GPG key material is never copied into the repository tree.
 
 ## Qualification
@@ -438,14 +476,23 @@ go test ./...
 go test -race ./...
 go vet ./...
 ./tests/qualification.sh
+./tests/repository-contract-qualification.sh
+./tests/ssh-output-qualification.sh
 ./tests/dependency-qualification.sh
+./tests/version-qualification.sh
 ```
 
 The signed qualification covers signature verification, APT install, upgrade,
 and downgrade, plus signed unlist/delete against a live client that retains an
-installed package. The dependency qualification proves that relationship
+installed package. The repository-contract qualification covers empty signed
+initialization, APT update, transition to the first package, browser sidecars,
+and non-destructive refusal of existing paths. The SSH-output qualification
+uses a disposable OpenSSH/SFTP server to check strict host-key behavior,
+new-destination safety, interruption recovery, and APT install from a remote
+repository tree. The dependency qualification proves that relationship
 metadata survives repository generation and APT resolves both direct and
-transitive dependencies automatically.
+transitive dependencies automatically. The version qualification checks
+package/runtime/provenance/help consistency.
 
 ## CI package qualification and production boundary
 
@@ -463,11 +510,11 @@ versioned CI artifact: the workflow does not create tags or authorize a
 release. GitHub Actions has read-only repository permissions and no production
 credentials, production signing key, or VServer access.
 
-Production publication remains exclusively with the trusted VServer runner. It
-clones the canonical source, independently runs the same `./build.sh` entry
-point and qualification scripts, creates or updates the actual managed
-repository, signs with the authorized production key, and updates tpa.run. CI
-success and CI artifacts do not publish to or mutate that repository and do
+Production publication is a separate authorized operation and is not qualified
+by this repository-contract work. A release runner must use the approved hosted
+staging workflow, build from an exact authorized source revision, independently
+verify the result, and keep signing authority outside the TPA build. CI success
+and CI artifacts do not publish to or mutate a production repository and do
 not authorize publication.
 
 ## 10,000-package benchmark snapshot
@@ -509,7 +556,6 @@ The following are optional repository-format improvements, not baseline
 requirements:
 
 - APT by-hash indexes
-- reproducible `Release` dates
 - detached `Release.gpg` output
 
 ## License

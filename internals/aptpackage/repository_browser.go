@@ -39,10 +39,10 @@ type repositoryBrowserField struct {
 	Value string
 }
 
-// writeRepositoryBrowserFiles builds one canonical view from the package
+// renderRepositoryBrowserFiles builds one canonical view from the package
 // indexes named by this distribution's Release file, then renders both
 // convenience formats from that view.
-func writeRepositoryBrowserFiles(root string, repo RepoConfig) error {
+func renderRepositoryBrowserFiles(root string, repo RepoConfig) ([]byte, []byte, error) {
 	component := repo.Components
 	if component == "" {
 		component = "main"
@@ -52,13 +52,13 @@ func writeRepositoryBrowserFiles(root string, repo RepoConfig) error {
 		codename = "stable"
 	}
 	distRoot := filepath.Join(root, "dists", codename)
-	releaseData, err := os.ReadFile(filepath.Join(distRoot, "Release"))
+	releaseData, err := readRepositoryTreeFile(filepath.Join(distRoot, "Release"), maxRepositoryReleaseBytes)
 	if err != nil {
-		return fmt.Errorf("read repository Release for browser index: %w", err)
+		return nil, nil, fmt.Errorf("read repository Release for browser index: %w", err)
 	}
 	checksums, err := parseReleaseChecksums(releaseData)
 	if err != nil {
-		return fmt.Errorf("parse repository Release for browser index: %w", err)
+		return nil, nil, fmt.Errorf("parse repository Release for browser index: %w", err)
 	}
 	componentPrefix := component + "/binary-"
 	var indexPaths []string
@@ -73,43 +73,43 @@ func writeRepositoryBrowserFiles(root string, repo RepoConfig) error {
 		}
 		indexPath, err := safeRepositoryPath(distRoot, relative)
 		if err != nil {
-			return fmt.Errorf("invalid package index path %q: %w", relative, err)
+			return nil, nil, fmt.Errorf("invalid package index path %q: %w", relative, err)
 		}
 		info, err := os.Lstat(indexPath)
 		if err != nil {
-			return fmt.Errorf("inspect package index %s: %w", indexPath, err)
+			return nil, nil, fmt.Errorf("inspect package index %s: %w", indexPath, err)
 		}
 		if !info.Mode().IsRegular() {
-			return fmt.Errorf("package index is not a regular file: %s", indexPath)
+			return nil, nil, fmt.Errorf("package index is not a regular file: %s", indexPath)
 		}
 		indexPaths = append(indexPaths, indexPath)
 	}
 	sort.Strings(indexPaths)
 	if len(indexPaths) == 0 {
-		return fmt.Errorf("no Packages indexes found under %s", distRoot)
+		return nil, nil, fmt.Errorf("no Packages indexes found under %s", distRoot)
 	}
 
 	index := repositoryBrowserIndex{
-		Format: "tpa-repository-index", Version: 1,
+		Format: RepositoryBrowserFormat, Version: RepositoryBrowserVersion,
 		Packages: make([]repositoryBrowserEntry, 0),
 	}
 	for _, indexPath := range indexPaths {
-		data, err := os.ReadFile(indexPath)
+		data, err := readRepositoryTreeFile(indexPath, maxRepositoryIndexBytes)
 		if err != nil {
-			return fmt.Errorf("read package index %s: %w", indexPath, err)
+			return nil, nil, fmt.Errorf("read package index %s: %w", indexPath, err)
 		}
 		stanzas, err := parseRawControlStanzas(data)
 		if err != nil {
-			return fmt.Errorf("parse package index %s: %w", indexPath, err)
+			return nil, nil, fmt.Errorf("parse package index %s: %w", indexPath, err)
 		}
 		for _, stanza := range stanzas {
 			metadata, err := parseRepositoryBrowserMetadata(stanza.raw)
 			if err != nil {
-				return fmt.Errorf("parse package metadata in %s: %w", indexPath, err)
+				return nil, nil, fmt.Errorf("parse package metadata in %s: %w", indexPath, err)
 			}
 			entry, err := newRepositoryBrowserEntry(metadata)
 			if err != nil {
-				return fmt.Errorf("prepare package metadata in %s: %w", indexPath, err)
+				return nil, nil, fmt.Errorf("prepare package metadata in %s: %w", indexPath, err)
 			}
 			index.Packages = append(index.Packages, entry)
 		}
@@ -126,19 +126,67 @@ func writeRepositoryBrowserFiles(root string, repo RepoConfig) error {
 
 	jsonData, err := json.MarshalIndent(index, "", "  ")
 	if err != nil {
-		return fmt.Errorf("encode repository package index: %w", err)
+		return nil, nil, fmt.Errorf("encode repository package index: %w", err)
 	}
 	jsonData = append(jsonData, '\n')
+	var htmlData bytes.Buffer
+	if err := repositoryBrowserTemplate.Execute(&htmlData, index); err != nil {
+		return nil, nil, fmt.Errorf("render repository browser: %w", err)
+	}
+	if int64(len(jsonData)) > maxRepositoryIndexBytes || int64(htmlData.Len()) > maxRepositoryIndexBytes {
+		return nil, nil, fmt.Errorf("repository browser sidecar exceeds %d bytes", maxRepositoryIndexBytes)
+	}
+	return jsonData, htmlData.Bytes(), nil
+}
+
+func writeRepositoryBrowserFiles(root string, repo RepoConfig) error {
+	jsonData, htmlData, err := renderRepositoryBrowserFiles(root, repo)
+	if err != nil {
+		return err
+	}
 	if err := os.WriteFile(filepath.Join(root, "repository.json"), jsonData, 0o644); err != nil {
 		return fmt.Errorf("write repository package index: %w", err)
 	}
-
-	var htmlData bytes.Buffer
-	if err := repositoryBrowserTemplate.Execute(&htmlData, index); err != nil {
-		return fmt.Errorf("render repository browser: %w", err)
-	}
-	if err := os.WriteFile(filepath.Join(root, "index.html"), htmlData.Bytes(), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(root, "index.html"), htmlData, 0o644); err != nil {
 		return fmt.Errorf("write repository package browser: %w", err)
+	}
+	return nil
+}
+
+func verifyRepositoryBrowserFiles(root string, repo RepoConfig, required bool) error {
+	jsonPath, htmlPath := filepath.Join(root, "repository.json"), filepath.Join(root, "index.html")
+	jsonInfo, jsonErr := os.Lstat(jsonPath)
+	htmlInfo, htmlErr := os.Lstat(htmlPath)
+	jsonMissing, htmlMissing := os.IsNotExist(jsonErr), os.IsNotExist(htmlErr)
+	if jsonMissing && htmlMissing && !required {
+		return nil
+	}
+	if jsonErr != nil && !jsonMissing {
+		return fmt.Errorf("inspect repository.json: %w", jsonErr)
+	}
+	if htmlErr != nil && !htmlMissing {
+		return fmt.Errorf("inspect index.html: %w", htmlErr)
+	}
+	if jsonMissing || htmlMissing {
+		return fmt.Errorf("repository browser sidecars must be present as a pair")
+	}
+	if !jsonInfo.Mode().IsRegular() || !htmlInfo.Mode().IsRegular() {
+		return fmt.Errorf("repository browser sidecars must be regular files")
+	}
+	wantJSON, wantHTML, err := renderRepositoryBrowserFiles(root, repo)
+	if err != nil {
+		return err
+	}
+	gotJSON, err := readRepositoryTreeFile(jsonPath, maxRepositoryIndexBytes)
+	if err != nil {
+		return err
+	}
+	gotHTML, err := readRepositoryTreeFile(htmlPath, maxRepositoryIndexBytes)
+	if err != nil {
+		return err
+	}
+	if !bytes.Equal(gotJSON, wantJSON) || !bytes.Equal(gotHTML, wantHTML) {
+		return fmt.Errorf("repository browser sidecars do not match the APT package indexes")
 	}
 	return nil
 }

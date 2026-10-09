@@ -15,7 +15,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"time"
+	"unicode/utf8"
 )
 
 const MaxPackWorkers = 32
@@ -32,10 +32,13 @@ type repositoryPackage struct {
 // pool. Pool population is deliberately independent of signing: unsigned
 // repositories are useful for local testing and must still be complete.
 func Pack(cfg Config) error {
+	if err := validateDirectPackOutput(cfg.OutDir); err != nil {
+		return err
+	}
 	if err := buildRepository(cfg); err != nil {
 		return err
 	}
-	return verifyRepository(cfg)
+	return VerifyTPARepositoryTree(cfg)
 }
 
 // buildRepository materializes a repository at cfg.OutDir. AtomicPack uses it
@@ -45,19 +48,60 @@ func buildRepository(cfg Config) error {
 	if err != nil {
 		return err
 	}
-	enumerationStage := startStage(stageDirectoryEnumeration)
-	entries, err := os.ReadDir(cfg.InDir)
-	enumerationStage()
-	if err != nil {
-		return fmt.Errorf("read package directory: %w", err)
+	component := cfg.Repo.Components
+	if component == "" {
+		component = "main"
 	}
-
-	pkgs, err := inspectAndDeduplicate(entries, cfg.InDir, workers)
+	codename := cfg.Repo.Codename
+	if codename == "" {
+		codename = "stable"
+	}
+	if !validRepositoryNameSegment(component) {
+		return fmt.Errorf("invalid repository component %q", component)
+	}
+	if !validRepositoryNameSegment(codename) {
+		return fmt.Errorf("invalid repository codename %q", codename)
+	}
+	origin, label, suite := cfg.Repo.Origin, cfg.Repo.Label, cfg.Repo.Suite
+	if origin == "" {
+		origin = "TPA-Repo"
+	}
+	if label == "" {
+		label = origin
+	}
+	if suite == "" {
+		suite = codename
+	}
+	description := cfg.Repo.Description
+	if description == "" {
+		description = "TPA package repository"
+	}
+	for field, value := range map[string]string{"Origin": origin, "Label": label, "Suite": suite, "Components": component, "Codename": codename, "Description": description} {
+		if err := validateReleaseField(field, value); err != nil {
+			return err
+		}
+	}
+	releaseDate, err := repositoryReleaseDate()
 	if err != nil {
 		return err
 	}
-	if len(pkgs) == 0 {
-		return fmt.Errorf("no .deb packages found in %s", cfg.InDir)
+	var pkgs []repositoryPackage
+	if len(cfg.emptyRepositoryArchitectures) == 0 {
+		enumerationStage := startStage(stageDirectoryEnumeration)
+		entries, err := os.ReadDir(cfg.InDir)
+		enumerationStage()
+		if err != nil {
+			return fmt.Errorf("read package directory: %w", err)
+		}
+		pkgs, err = inspectAndDeduplicate(entries, cfg.InDir, workers)
+		if err != nil {
+			return err
+		}
+		if len(pkgs) == 0 {
+			return fmt.Errorf("no .deb packages found in %s", cfg.InDir)
+		}
+	} else if err := validateEmptyRepository(cfg, cfg.emptyRepositoryArchitectures); err != nil {
+		return err
 	}
 	sortStage := startStage(stageSortAndGroup)
 	sort.Slice(pkgs, func(i, j int) bool {
@@ -74,17 +118,12 @@ func buildRepository(cfg Config) error {
 	})
 	sortStage()
 
-	component := cfg.Repo.Components
-	if component == "" {
-		component = "main"
-	}
-	codename := cfg.Repo.Codename
-	if codename == "" {
-		codename = "stable"
-	}
 	distDir := filepath.Join(cfg.OutDir, "dists", codename)
 	if err := os.MkdirAll(distDir, 0o755); err != nil {
 		return fmt.Errorf("create distribution directory: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Join(cfg.OutDir, "pool", component), 0o755); err != nil {
+		return fmt.Errorf("create package pool: %w", err)
 	}
 
 	// Copy first, so a successful return always leaves a usable pool.
@@ -114,6 +153,9 @@ func buildRepository(cfg Config) error {
 
 	groupStage := startStage(stageGroupArchitectures)
 	byArch := make(map[string][]repositoryPackage)
+	for _, architecture := range cfg.emptyRepositoryArchitectures {
+		byArch[architecture] = nil
+	}
 	for _, pkg := range pkgs {
 		byArch[pkg.Control.Architecture] = append(byArch[pkg.Control.Architecture], pkg)
 	}
@@ -130,24 +172,10 @@ func buildRepository(cfg Config) error {
 		return fmt.Errorf("create Release: %w", err)
 	}
 	closeRelease := func() error { return release.Close() }
-	origin, label, suite := cfg.Repo.Origin, cfg.Repo.Label, cfg.Repo.Suite
-	if origin == "" {
-		origin = "TPA-Repo"
-	}
-	if label == "" {
-		label = origin
-	}
-	if suite == "" {
-		suite = codename
-	}
-	description := cfg.Repo.Description
-	if description == "" {
-		description = "TPA package repository"
-	}
 	releaseWriteStage := startStage(stageReleaseWrite)
 	_, err = fmt.Fprintf(release, "Origin: %s\nLabel: %s\nSuite: %s\nArchitectures: %s\nComponents: %s\nCodename: %s\nDate: %s\nDescription: %s\nSHA256:\n",
 		origin, label, suite, strings.Join(architectures, " "), component, codename,
-		time.Now().UTC().Format(time.RFC1123Z), description)
+		releaseDate, description)
 	releaseWriteStage()
 	if err != nil {
 		_ = closeRelease()
@@ -241,6 +269,9 @@ func buildRepository(cfg Config) error {
 // repositoryControlStanza preserves the control metadata emitted by dpkg-deb
 // while removing fields whose values must be derived from the published file.
 func repositoryControlStanza(raw []byte) ([]byte, error) {
+	if !utf8.Valid(raw) {
+		return nil, fmt.Errorf("package control stanza is not valid UTF-8")
+	}
 	controlled := map[string]bool{"filename": true, "size": true, "sha256": true}
 	scanner := bufio.NewScanner(bytes.NewReader(raw))
 	scanner.Buffer(make([]byte, 64*1024), 16*1024*1024)
@@ -301,13 +332,19 @@ func copyFileAndHash(src, dst string) (string, int64, error) {
 		return "", 0, err
 	}
 	hash := sha256.New()
-	size, copyErr := io.Copy(io.MultiWriter(dest, hash), source)
+	size, copyErr := io.Copy(io.MultiWriter(dest, hash), io.LimitReader(source, maxRepositoryArtifactBytes+1))
 	closeErr := dest.Close()
 	if copyErr != nil {
+		_ = os.Remove(dst)
 		return "", 0, copyErr
 	}
 	if closeErr != nil {
+		_ = os.Remove(dst)
 		return "", 0, closeErr
+	}
+	if size <= 0 || size > maxRepositoryArtifactBytes {
+		_ = os.Remove(dst)
+		return "", 0, fmt.Errorf("package artifact exceeds %d bytes", maxRepositoryArtifactBytes)
 	}
 	return hex.EncodeToString(hash.Sum(nil)), size, nil
 }
@@ -402,6 +439,21 @@ func inspectAndDeduplicate(entries []os.DirEntry, root string, workers int) ([]r
 		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".deb") {
 			return orderedInspectionResult{skip: true}, nil
 		}
+		if !validRepositoryArtifactBasename(entry.Name()) {
+			return orderedInspectionResult{}, fmt.Errorf("invalid .deb artifact basename %q", entry.Name())
+		}
+		statStage := startStage(stageStatSource)
+		info, err := entry.Info()
+		statStage()
+		if err != nil {
+			return orderedInspectionResult{}, fmt.Errorf("stat %s: %w", entry.Name(), err)
+		}
+		if !info.Mode().IsRegular() {
+			return orderedInspectionResult{}, fmt.Errorf("package is not a regular file: %s", entry.Name())
+		}
+		if info.Size() <= 0 || info.Size() > maxRepositoryArtifactBytes {
+			return orderedInspectionResult{}, fmt.Errorf("package artifact size is outside the supported range: %s", entry.Name())
+		}
 		path := filepath.Join(root, entry.Name())
 		inspectStage := startStage(stageInspect)
 		rawControl, err := readPackageControl(path)
@@ -415,19 +467,22 @@ func inspectAndDeduplicate(entries []os.DirEntry, root string, workers int) ([]r
 			metadataStage()
 			return orderedInspectionResult{}, fmt.Errorf("parse %s: %w", entry.Name(), err)
 		}
+		if !validRepositoryPackageName(control.Name) {
+			metadataStage()
+			return orderedInspectionResult{}, fmt.Errorf("parse %s: invalid package name %q", entry.Name(), control.Name)
+		}
+		if !safeLifecycleSegment(control.Version) {
+			metadataStage()
+			return orderedInspectionResult{}, fmt.Errorf("parse %s: invalid version %q", entry.Name(), control.Version)
+		}
+		if !validRepositoryArchitecture(control.Architecture) {
+			metadataStage()
+			return orderedInspectionResult{}, fmt.Errorf("parse %s: invalid architecture %q", entry.Name(), control.Architecture)
+		}
 		stanza, err := repositoryControlStanza(rawControl)
 		metadataStage()
 		if err != nil {
 			return orderedInspectionResult{}, fmt.Errorf("prepare metadata for %s: %w", entry.Name(), err)
-		}
-		statStage := startStage(stageStatSource)
-		info, err := os.Stat(path)
-		statStage()
-		if err != nil {
-			return orderedInspectionResult{}, fmt.Errorf("stat %s: %w", entry.Name(), err)
-		}
-		if !info.Mode().IsRegular() {
-			return orderedInspectionResult{}, fmt.Errorf("package is not a regular file: %s", entry.Name())
 		}
 		return orderedInspectionResult{packageData: repositoryPackage{
 			Control: control, ControlStanza: stanza, Dist: path, Size: info.Size(),

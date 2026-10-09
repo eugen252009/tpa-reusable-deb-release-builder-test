@@ -204,6 +204,21 @@ func loadVerifiedLifecycleRepository(cfg Config, repository string) (string, Con
 	cfg.Repo.Codename = codename
 	cfg.OutDir = root
 	distDir := filepath.Join(root, "dists", codename)
+	releaseData, err := readRepositoryTreeFile(filepath.Join(distDir, "Release"), maxRepositoryReleaseBytes)
+	if err != nil {
+		return "", cfg, fmt.Errorf("read repository Release: %w", err)
+	}
+	releaseFields, _, err := parseRepositoryRelease(releaseData)
+	if err != nil {
+		return "", cfg, fmt.Errorf("parse repository Release: %w", err)
+	}
+	if releaseFields["codename"] != codename || releaseFields["components"] != component {
+		return "", cfg, fmt.Errorf("repository Release does not match the selected codename and component")
+	}
+	cfg.Repo.Origin = releaseFields["origin"]
+	cfg.Repo.Label = releaseFields["label"]
+	cfg.Repo.Suite = releaseFields["suite"]
+	cfg.Repo.Description = releaseFields["description"]
 	if _, err := os.Lstat(filepath.Join(distDir, "Release.gpg")); err == nil {
 		return "", cfg, fmt.Errorf("detached Release.gpg signatures are unsupported for lifecycle mutations")
 	} else if !os.IsNotExist(err) {
@@ -274,6 +289,7 @@ func validateRepositoryTree(root string) error {
 	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
 		return fmt.Errorf("repository root must be a real directory")
 	}
+	files, directories := 0, 0
 	return filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
@@ -282,7 +298,15 @@ func validateRepositoryTree(root string) error {
 			return fmt.Errorf("repository contains symlink %s", path)
 		}
 		if entry.IsDir() {
+			directories++
+			if directories > maxGenerationDirectories {
+				return fmt.Errorf("repository exceeds %d directories", maxGenerationDirectories)
+			}
 			return nil
+		}
+		files++
+		if files > maxGenerationFiles {
+			return fmt.Errorf("repository exceeds %d files", maxGenerationFiles)
 		}
 		fileInfo, err := entry.Info()
 		if err != nil {
@@ -579,7 +603,7 @@ func publishUnlistedCandidate(root string, cfg Config, identity PackageIdentity,
 		return lifecycleArtifact{}, fmt.Errorf("prepare lifecycle generation permissions: %w", err)
 	}
 	cfg.OutDir = staging
-	if err := verifyRepository(cfg); err != nil {
+	if err := VerifyTPARepositoryTree(cfg); err != nil {
 		return lifecycleArtifact{}, fmt.Errorf("verify lifecycle generation: %w", err)
 	}
 	if err := beforeLifecyclePublish(staging); err != nil {

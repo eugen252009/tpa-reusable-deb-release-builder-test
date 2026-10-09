@@ -27,6 +27,8 @@ and riscv64.
   uncertain.
 - Local atomic publication classifies post-activation errors so callers can
   distinguish an active candidate from a pre-activation failure.
+- Package provenance and Debian archive timestamps honor a pinned
+  `SOURCE_DATE_EPOCH`, enabling repeatable release builds from the same source.
 
 ## Compatibility and limitations
 

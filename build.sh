@@ -6,6 +6,7 @@ cd "$ROOT"
 
 ARCHS="amd64 riscv64 arm64"
 DESC=$(cat description.txt)
+# Set SOURCE_DATE_EPOCH for reproducible provenance and Debian archive timestamps.
 VERSION=${TPA_VERSION:-0.0.0~dev}
 if ! dpkg --validate-version "$VERSION" >/dev/null 2>&1; then
     echo "Invalid Debian version in TPA_VERSION: $VERSION" >&2

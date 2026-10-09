@@ -24,13 +24,14 @@ APT repository and does not modify caller repositories.
   is the source commit timestamp; project build scripts should normalize
   generated payload timestamps accordingly.
 - The bundle contains one `.deb` per architecture, a deterministic source
-  archive, `SHA256SUMS.txt`, `release-manifest.json`, `provenance.json`, and
-  release notes. Git submodules and Git LFS pointers are rejected rather than
-  silently omitted from the source archive. Package metadata and qualification
-  records are independently rechecked before bundling and before publication.
-  GitHub normalizes `~` to `.` in release asset names; published filenames and
-  the release checksum list use that normalized form, while Debian versions in
-  package metadata and manifests retain their canonical `~` spelling.
+  archive, `SHA256SUMS.txt`, `SHA256SUMS-GITHUB.txt`, `release-manifest.json`,
+  `provenance.json`, and release notes. The second checksum list is attested
+  with the bundle and published as `SHA256SUMS.txt`. GitHub normalizes `~` to
+  `.` in release asset names, so that list uses the normalized asset filenames;
+  Debian versions in package metadata and manifests retain canonical `~`.
+  Git submodules and Git LFS pointers are rejected rather than silently omitted
+  from the source archive. Package metadata and qualification records are
+  independently rechecked before bundling and before publication.
 - Tag pushes create a GitHub build-provenance attestation, create/populate a
   draft release, read every uploaded asset back, then publish it. Published
   releases are never overwritten: a repeat must match the tag, source commit,

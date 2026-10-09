@@ -332,7 +332,7 @@ func releaseAssets(bundle string) ([]string, error) {
 	if err := json.Unmarshal(manifestBytes, &manifest); err != nil {
 		return nil, err
 	}
-	names := []string{"SHA256SUMS.txt", "release-manifest.json", "provenance.json", manifest.SourceArchive.Filename}
+	names := []string{"SHA256SUMS-GITHUB.txt", "release-manifest.json", "provenance.json", manifest.SourceArchive.Filename}
 	for _, artifact := range manifest.Artifacts {
 		names = append(names, artifact.Filename)
 	}
@@ -367,10 +367,10 @@ func projectGitHubReleaseAssets(bundle string, assets []string, tempDir string) 
 	projected := append([]string(nil), assets...)
 	for i, path := range assets {
 		name := filepath.Base(path)
-		if name == "SHA256SUMS.txt" {
-			projectedPath := filepath.Join(tempDir, name)
-			if err := writeGitHubReleaseChecksums(bundle, projectedPath); err != nil {
-				return nil, err
+		if name == "SHA256SUMS-GITHUB.txt" {
+			projectedPath := filepath.Join(tempDir, "SHA256SUMS.txt")
+			if err := copyRegularFile(path, projectedPath); err != nil {
+				return nil, fmt.Errorf("prepare GitHub release checksum asset: %w", err)
 			}
 			projected[i] = projectedPath
 			continue
@@ -386,46 +386,6 @@ func projectGitHubReleaseAssets(bundle string, assets []string, tempDir string) 
 		projected[i] = projectedPath
 	}
 	return projected, nil
-}
-
-func writeGitHubReleaseChecksums(bundle, output string) error {
-	manifestBytes, err := readRegularFile(filepath.Join(bundle, "release-manifest.json"))
-	if err != nil {
-		return err
-	}
-	var manifest ReleaseManifest
-	if err := json.Unmarshal(manifestBytes, &manifest); err != nil {
-		return err
-	}
-	type checksum struct {
-		name, digest string
-	}
-	checksums := make([]checksum, 0, len(manifest.Artifacts)+1)
-	add := func(name, expectedDigest string, expectedSize int64) error {
-		digest, size, err := fileDigest(filepath.Join(bundle, name))
-		if err != nil {
-			return err
-		}
-		if digest != expectedDigest || size != expectedSize {
-			return fmt.Errorf("release asset %s changed while preparing GitHub publication", name)
-		}
-		checksums = append(checksums, checksum{name: githubReleaseAssetName(name), digest: digest})
-		return nil
-	}
-	for _, artifact := range manifest.Artifacts {
-		if err := add(artifact.Filename, artifact.SHA256, artifact.Size); err != nil {
-			return err
-		}
-	}
-	if err := add(manifest.SourceArchive.Filename, manifest.SourceArchive.SHA256, manifest.SourceArchive.Size); err != nil {
-		return err
-	}
-	sort.Slice(checksums, func(i, j int) bool { return checksums[i].name < checksums[j].name })
-	var content strings.Builder
-	for _, entry := range checksums {
-		fmt.Fprintf(&content, "%s  %s\n", entry.digest, entry.name)
-	}
-	return os.WriteFile(output, []byte(content.String()), 0644)
 }
 
 func verifyReleaseAssetSet(repository string, releaseID int64, expected map[string]string, expectedCount int) error {

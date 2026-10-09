@@ -273,6 +273,24 @@ func CreateBundle(cfg Config, options BundleOptions) (ReleaseManifest, error) {
 	if err := os.WriteFile(filepath.Join(options.OutputDir, "SHA256SUMS.txt"), []byte(sumText.String()), 0644); err != nil {
 		return ReleaseManifest{}, err
 	}
+	githubChecksums := make([]struct{ name, digest string }, 0, len(checksums))
+	githubNames := make(map[string]bool, len(checksums))
+	for _, item := range checksums {
+		name := githubReleaseAssetName(item.name)
+		if githubNames[name] {
+			return ReleaseManifest{}, fmt.Errorf("release assets collide as GitHub filename %q", name)
+		}
+		githubNames[name] = true
+		githubChecksums = append(githubChecksums, struct{ name, digest string }{name, item.digest})
+	}
+	sort.Slice(githubChecksums, func(i, j int) bool { return githubChecksums[i].name < githubChecksums[j].name })
+	var githubSumText strings.Builder
+	for _, item := range githubChecksums {
+		fmt.Fprintf(&githubSumText, "%s  %s\n", item.digest, item.name)
+	}
+	if err := os.WriteFile(filepath.Join(options.OutputDir, "SHA256SUMS-GITHUB.txt"), []byte(githubSumText.String()), 0644); err != nil {
+		return ReleaseManifest{}, err
+	}
 
 	buildIdentity := BuildIdentity{WorkflowRef: options.WorkflowRef, WorkflowSHA: options.WorkflowSHA, RunID: options.RunID,
 		RunAttempt: options.RunAttempt, GoVersion: options.GoVersion, TPAVersion: options.TPAVersion, TPACommit: options.TPACommit,
@@ -412,6 +430,17 @@ func VerifyBundle(cfg Config, plan Plan, bundleDir, builderVersion, builderCommi
 	if err := verifyChecksums(filepath.Join(bundleDir, "SHA256SUMS.txt"), checksumExpected); err != nil {
 		return err
 	}
+	githubChecksumExpected := make(map[string]string, len(checksumExpected))
+	for name, digest := range checksumExpected {
+		githubName := githubReleaseAssetName(name)
+		if _, duplicate := githubChecksumExpected[githubName]; duplicate {
+			return fmt.Errorf("release assets collide as GitHub checksum filename %q", githubName)
+		}
+		githubChecksumExpected[githubName] = digest
+	}
+	if err := verifyChecksums(filepath.Join(bundleDir, "SHA256SUMS-GITHUB.txt"), githubChecksumExpected); err != nil {
+		return fmt.Errorf("verify GitHub release checksums: %w", err)
+	}
 	var provenance Provenance
 	provenanceBytes, err := readRegularFile(filepath.Join(bundleDir, "provenance.json"))
 	if err != nil {
@@ -428,7 +457,7 @@ func VerifyBundle(cfg Config, plan Plan, bundleDir, builderVersion, builderCommi
 			return fmt.Errorf("provenance artifact set differs from release manifest")
 		}
 	}
-	allowed := map[string]bool{"SHA256SUMS.txt": true, "release-manifest.json": true, "provenance.json": true, manifest.SourceArchive.Filename: true}
+	allowed := map[string]bool{"SHA256SUMS.txt": true, "SHA256SUMS-GITHUB.txt": true, "release-manifest.json": true, "provenance.json": true, manifest.SourceArchive.Filename: true}
 	for _, artifact := range manifest.Artifacts {
 		allowed[artifact.Filename] = true
 	}

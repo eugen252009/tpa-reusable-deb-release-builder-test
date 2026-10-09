@@ -73,6 +73,15 @@ func PublishGitHubRelease(options PublishOptions) error {
 	if err != nil {
 		return err
 	}
+	assetProjection, err := os.MkdirTemp("", "tpa-github-release-assets-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(assetProjection)
+	assets, err = projectGitHubReleaseAssets(options.BundleDir, assets, assetProjection)
+	if err != nil {
+		return err
+	}
 	release, exists, err := getRelease(options.Repository, options.Plan.Tag)
 	if err != nil {
 		return err
@@ -339,15 +348,84 @@ func releaseAssets(bundle string) ([]string, error) {
 	return paths, nil
 }
 
+func githubReleaseAssetName(name string) string {
+	return strings.ReplaceAll(name, "~", ".")
+}
+
 func githubReleaseAssetNames(name string) []string {
 	// GitHub normalizes tildes to dots in uploaded release asset names.
-	// Accept both forms when reading existing assets, but upload the exact
-	// qualified local filename and verify the downloaded bytes either way.
-	normalized := strings.ReplaceAll(name, "~", ".")
+	// Accept both forms when reading existing assets, but verify downloaded
+	// bytes against the exact qualified local file either way.
+	normalized := githubReleaseAssetName(name)
 	if normalized == name {
 		return []string{name}
 	}
 	return []string{name, normalized}
+}
+
+func projectGitHubReleaseAssets(bundle string, assets []string, tempDir string) ([]string, error) {
+	projected := append([]string(nil), assets...)
+	for i, path := range assets {
+		name := filepath.Base(path)
+		if name == "SHA256SUMS.txt" {
+			projectedPath := filepath.Join(tempDir, name)
+			if err := writeGitHubReleaseChecksums(bundle, projectedPath); err != nil {
+				return nil, err
+			}
+			projected[i] = projectedPath
+			continue
+		}
+		normalized := githubReleaseAssetName(name)
+		if normalized == name {
+			continue
+		}
+		projectedPath := filepath.Join(tempDir, normalized)
+		if err := copyRegularFile(path, projectedPath); err != nil {
+			return nil, fmt.Errorf("prepare GitHub-normalized release asset %s: %w", name, err)
+		}
+		projected[i] = projectedPath
+	}
+	return projected, nil
+}
+
+func writeGitHubReleaseChecksums(bundle, output string) error {
+	manifestBytes, err := readRegularFile(filepath.Join(bundle, "release-manifest.json"))
+	if err != nil {
+		return err
+	}
+	var manifest ReleaseManifest
+	if err := json.Unmarshal(manifestBytes, &manifest); err != nil {
+		return err
+	}
+	type checksum struct {
+		name, digest string
+	}
+	checksums := make([]checksum, 0, len(manifest.Artifacts)+1)
+	add := func(name, expectedDigest string, expectedSize int64) error {
+		digest, size, err := fileDigest(filepath.Join(bundle, name))
+		if err != nil {
+			return err
+		}
+		if digest != expectedDigest || size != expectedSize {
+			return fmt.Errorf("release asset %s changed while preparing GitHub publication", name)
+		}
+		checksums = append(checksums, checksum{name: githubReleaseAssetName(name), digest: digest})
+		return nil
+	}
+	for _, artifact := range manifest.Artifacts {
+		if err := add(artifact.Filename, artifact.SHA256, artifact.Size); err != nil {
+			return err
+		}
+	}
+	if err := add(manifest.SourceArchive.Filename, manifest.SourceArchive.SHA256, manifest.SourceArchive.Size); err != nil {
+		return err
+	}
+	sort.Slice(checksums, func(i, j int) bool { return checksums[i].name < checksums[j].name })
+	var content strings.Builder
+	for _, entry := range checksums {
+		fmt.Fprintf(&content, "%s  %s\n", entry.digest, entry.name)
+	}
+	return os.WriteFile(output, []byte(content.String()), 0644)
 }
 
 func verifyReleaseAssetSet(repository string, releaseID int64, expected map[string]string, expectedCount int) error {

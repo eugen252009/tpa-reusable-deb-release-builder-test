@@ -28,6 +28,9 @@ APT repository and does not modify caller repositories.
   release notes. Git submodules and Git LFS pointers are rejected rather than
   silently omitted from the source archive. Package metadata and qualification
   records are independently rechecked before bundling and before publication.
+  GitHub normalizes `~` to `.` in release asset names; published filenames and
+  the release checksum list use that normalized form, while Debian versions in
+  package metadata and manifests retain their canonical `~` spelling.
 - Tag pushes create a GitHub build-provenance attestation, create/populate a
   draft release, read every uploaded asset back, then publish it. Published
   releases are never overwritten: a repeat must match the tag, source commit,

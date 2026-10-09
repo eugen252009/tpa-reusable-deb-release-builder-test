@@ -288,6 +288,11 @@ func TestBuildPackageAndReproducibleBundle(t *testing.T) {
 	if state.Draft || state.Uploads != 1 || len(state.Assets) != 5 {
 		t.Fatalf("unexpected fake release state: %+v", state)
 	}
+	checksums := exec.Command("sha256sum", "-c", "SHA256SUMS.txt")
+	checksums.Dir = filepath.Join(filepath.Dir(statePath), "assets")
+	if output, err := checksums.CombinedOutput(); err != nil {
+		t.Fatalf("published release checksums do not match normalized asset names: %s: %v", output, err)
+	}
 	remotePackageName := strings.ReplaceAll(manifest.Artifacts[0].Filename, "~", ".")
 	remotePackage := filepath.Join(filepath.Dir(statePath), "assets", remotePackageName)
 	if err := os.WriteFile(remotePackage, []byte("tampered"), 0644); err != nil {

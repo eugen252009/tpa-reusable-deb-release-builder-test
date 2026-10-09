@@ -75,10 +75,15 @@ jobs:
     uses: eugen252009/tpa/.github/workflows/reusable-deb-release.yml@<TPA_FULL_COMMIT_SHA>
     with:
       config: .tpa-release.yml
+      tpa-repository: eugen252009/tpa # optional; defaults to the upstream TPA repo
       tpa-ref: <TPA_FULL_COMMIT_SHA>
       tpa-version: "0.7.0"
       go-version: "1.26.3" # omit for non-Go projects
 ```
+
+`tpa-repository` defaults to `eugen252009/tpa`; set it to a trusted fork when
+testing unpublished workflow commits. The exact `tpa-ref` commit must exist in
+that repository and is checked out by immutable SHA.
 
 For a project outside TPA, set `tpa-version` to the exact TPA builder version
 whose source SHA is pinned. `from-release-tag` makes the builder version equal

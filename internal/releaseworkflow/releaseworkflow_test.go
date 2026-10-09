@@ -26,6 +26,13 @@ func TestRepositoryReleaseConfigurationAndPinnedActions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	workflowText := string(workflow)
+	if got := strings.Count(workflowText, "repository: ${{ inputs.tpa-repository }}"); got != 5 {
+		t.Fatalf("expected all five TPA source checkouts to use the configured repository; found %d", got)
+	}
+	if !strings.Contains(workflowText, "default: eugen252009/tpa") {
+		t.Fatal("the upstream TPA repository must remain the default")
+	}
 	pinRE := regexp.MustCompile(`(?m)^\s*uses:\s+[^\s]+@([0-9a-f]{40})\s*$`)
 	pins := pinRE.FindAllSubmatch(workflow, -1)
 	if len(pins) < 5 {

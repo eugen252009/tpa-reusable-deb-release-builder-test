@@ -8,6 +8,11 @@ on:
         required: false
         type: string
         default: .tpa-release.yml
+      tpa-repository:
+        description: Repository containing the pinned TPA source commit
+        required: false
+        type: string
+        default: eugen252009/tpa
       tpa-ref:
         description: Full immutable 40-character TPA source commit containing this workflow
         required: true
@@ -29,6 +34,11 @@ on:
         required: false
         type: string
         default: .tpa-release.yml
+      tpa-repository:
+        description: Repository containing the pinned TPA source commit
+        required: false
+        type: string
+        default: eugen252009/tpa
       tpa-ref:
         description: Full immutable 40-character TPA source commit containing this workflow
         required: true
@@ -76,7 +86,7 @@ jobs:
       - name: Check out pinned TPA source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
-          repository: eugen252009/tpa
+          repository: ${{ inputs.tpa-repository }}
           ref: ${{ inputs.tpa-ref }}
           fetch-depth: 1
           persist-credentials: false
@@ -131,7 +141,7 @@ jobs:
       - name: Check out pinned TPA source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
-          repository: eugen252009/tpa
+          repository: ${{ inputs.tpa-repository }}
           ref: ${{ inputs.tpa-ref }}
           fetch-depth: 1
           persist-credentials: false
@@ -206,7 +216,7 @@ jobs:
       - name: Check out pinned TPA source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
-          repository: eugen252009/tpa
+          repository: ${{ inputs.tpa-repository }}
           ref: ${{ inputs.tpa-ref }}
           fetch-depth: 1
           persist-credentials: false
@@ -354,7 +364,7 @@ jobs:
       - name: Check out pinned TPA source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
-          repository: eugen252009/tpa
+          repository: ${{ inputs.tpa-repository }}
           ref: ${{ inputs.tpa-ref }}
           fetch-depth: 1
           persist-credentials: false
@@ -459,7 +469,7 @@ jobs:
       - name: Check out pinned TPA source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
-          repository: eugen252009/tpa
+          repository: ${{ inputs.tpa-repository }}
           ref: ${{ inputs.tpa-ref }}
           fetch-depth: 1
           persist-credentials: false
